@@ -6,6 +6,7 @@
 const AUDIO_PREFIX = {
   "audio.ngfiles.com": "/ext/ng",
   "geometrydashfiles.b-cdn.net": "/ext/cdn",
+  "geometrydashcontent.b-cdn.net": "/ext/cdn2",
 };
 
 async function handle(request) {
@@ -59,3 +60,4 @@ async function handle(request) {
 
 export const GET = handle;
 export const POST = handle;
+export const HEAD = handle;
