@@ -4,7 +4,7 @@
 //   /gd/audio-proxy?url=<song> -> fetches the song from Newgrounds / the GD song CDN
 
 const AUDIO_PREFIX = {
-  "audio.ngfiles.com": "/ext/ng",
+  "audio.ngfiles.com": "/ext/newgrounds",
   "geometrydashfiles.b-cdn.net": "/ext/cdn",
   "geometrydashcontent.b-cdn.net": "/ext/cdn2",
 };

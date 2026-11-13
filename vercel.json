@@ -1,7 +1,7 @@
 {
   "rewrites": [
     { "source": "/gd/:path*", "destination": "/api/gd?p=:path*" },
-    { "source": "/ext/ng/:path*", "destination": "https://audio.ngfiles.com/:path*" },
+    { "source": "/ext/newgrounds/:path*", "destination": "https://audio.ngfiles.com/:path*" },
     { "source": "/ext/cdn/:path*", "destination": "https://geometrydashfiles.b-cdn.net/:path*" },
     { "source": "/ext/cdn2/:path*", "destination": "https://geometrydashcontent.b-cdn.net/:path*" }
   ]
