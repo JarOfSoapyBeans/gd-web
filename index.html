@@ -1047,11 +1047,11 @@ https://discord.gg/gn-math
       function savePath(_0x22f8be) {
         const _0x3ae303 = _0x3835f7,
           _0x2fdf9e = String(_0x22f8be)[_0x3ae303(0xc1)](/\\/g, "/"),
-          _0x310f9d = _0x2fdf9e["startsWith"]("/")
-            ? _0x2fdf9e
-            : /^(AppData|Resources)\//["test"](_0x2fdf9e)
-              ? "/" + _0x2fdf9e
-              : "/Resources/" + _0x2fdf9e,
+          // The engine stores save files in /Resources but persists them under
+          // an "AppData/..." name, so map both prefixes back to /Resources.
+          _0x310f9d =
+            "/Resources/" +
+            _0x2fdf9e.replace(/^\/*(?:AppData|Resources)\//, "").replace(/^\/+/, ""),
           _0x26e404 = [];
         for (const _0x505bdd of _0x310f9d["split"]("/")) {
           if (_0x505bdd === "..") _0x26e404[_0x3ae303(0x12a)]();
