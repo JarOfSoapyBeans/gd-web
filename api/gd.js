@@ -3,7 +3,10 @@
 //   /gd/getGJLevels21.php      -> https://www.boomlings.com/database/getGJLevels21.php
 //   /gd/audio-proxy?url=<song> -> fetches the song from Newgrounds / the GD song CDN
 
-const AUDIO_HOSTS = ["audio.ngfiles.com", "geometrydashfiles.b-cdn.net"];
+const AUDIO_PREFIX = {
+  "audio.ngfiles.com": "/ext/ng",
+  "geometrydashfiles.b-cdn.net": "/ext/cdn",
+};
 
 async function handle(request) {
   const url = new URL(request.url);
@@ -14,12 +17,18 @@ async function handle(request) {
   let init;
 
   if (path === "audio-proxy") {
+    // Songs are often bigger than Vercel's 4.5 MB function limit, so don't pipe them
+    // through here. Redirect to a same-origin path that vercel.json rewrites straight
+    // to the song host (rewrites have no size limit and stay same-origin, so no CORS issue).
     const song = url.searchParams.get("url") || "";
-    let host = "";
-    try { host = new URL(song).hostname; } catch {}
-    if (!AUDIO_HOSTS.includes(host)) return new Response("Bad audio URL", { status: 400 });
-    target = song;
-    init = { method: "GET" };
+    let parsed;
+    try { parsed = new URL(song); } catch {}
+    const prefix = parsed && AUDIO_PREFIX[parsed.hostname];
+    if (!prefix) return new Response("Bad audio URL", { status: 400 });
+    return new Response(null, {
+      status: 307,
+      headers: { Location: prefix + parsed.pathname + parsed.search },
+    });
   } else if (/^[A-Za-z0-9_]+\.php$/.test(path)) {
     const query = url.searchParams.toString();
     target = "https://www.boomlings.com/database/" + path + (query ? "?" + query : "");
