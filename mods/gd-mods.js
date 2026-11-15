@@ -307,7 +307,11 @@
       { key: "freezeWhileOpen", type: "bool", label: "Pause game while menu is open", default: true },
     ],
     hotkeys: [{ setting: "openKey", run: () => ui.toggle() }],
-    onSetting(k) { if (k === "showButton") ui.refreshButton(); },
+    onSetting(k) {
+      // k is undefined after "Reset to defaults"
+      if (!k || k === "showButton") ui.refreshButton();
+      if ((!k || k === "freezeWhileOpen") && ui.isOpen()) hold("menu", !!menuMod.get("freezeWhileOpen"));
+    },
   });
 
   const speedMod = defineMod({
