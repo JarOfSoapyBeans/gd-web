@@ -33,11 +33,12 @@
   const dateOffset = realDateNow() - realNow();
   const clock = {
     speed: 1,          // speedhack multiplier
-    holds: new Set(),  // reasons the game is frozen ("step", "menu")
+    holds: new Set(),  // reasons the game should be frozen ("step", "menu")
+    parked: false,     // true only while the engine is actually held in its frame wait
     baseReal: realNow(),
     baseVirt: realNow(),
   };
-  function factor() { return clock.holds.size ? 0 : clock.speed; }
+  function factor() { return clock.parked ? 0 : clock.speed; }
   function virtNow() {
     return clock.baseVirt + (realNow() - clock.baseReal) * factor();
   }
@@ -90,7 +91,7 @@
   }
   function applyAudio() {
     patchChPos();
-    const next = clock.holds.size ? 0 : (audio.follow ? clock.speed : 1);
+    const next = clock.parked ? 0 : (audio.follow ? clock.speed : 1);
     if (next === audio.factor) return;
     const A = gdAudio();
     if (A && A.ctx) {
@@ -140,13 +141,17 @@
     patchScript(node);
     return insertFns.insertBefore.call(this, node, ref);
   };
+  // The clock is stopped only once the engine is parked here: it also reads the clock
+  // in the middle of a frame, and stopping it there would leave it waiting forever.
   window.__dmYield = function (target) {
     gate.yields++;
     gate.lastTarget = target;
     if (!clock.holds.size) return null;
+    if (!clock.parked) { rebaseClock(); clock.parked = true; applyAudio(); }
     return new Promise((res) => gate.waiters.push(res));
   };
   function releaseGate() {
+    if (clock.parked) { rebaseClock(); clock.parked = false; applyAudio(); }
     const w = gate.waiters;
     gate.waiters = [];
     for (const f of w) f();
@@ -159,16 +164,16 @@
     applyAudio();
   }
   function hold(reason, on) {
-    // Without the frame gate, stopping the clock would hang the page, so refuse.
+    // Without the frame gate, stopping the game would hang the page, so refuse.
     if (on && !gate.hooked) return false;
-    rebaseClock();
     if (on) clock.holds.add(reason); else clock.holds.delete(reason);
-    applyAudio();
     if (!clock.holds.size) releaseGate();
+    return true;
   }
   function stepFrame(ms) {
-    // Advance frozen game time by one step and let exactly one engine frame run.
-    if (!clock.holds.size) return;
+    // Move game time forward one step, then let one engine frame run (it parks again
+    // at its next frame wait because the hold is still on).
+    if (!clock.holds.size || !clock.parked) return;
     clock.baseVirt += ms;
     releaseGate();
   }
@@ -287,7 +292,7 @@
     id: "dashmods.menu",
     name: "DashMods",
     version: "1.0.0",
-    author: "you",
+    author: "gd-web",
     icon: "◆",
     color: "#6c4cf5",
     locked: true,
@@ -309,7 +314,7 @@
     id: "dashmods.speedhack",
     name: "Speedhack",
     version: "1.0.0",
-    author: "you",
+    author: "gd-web",
     icon: "»",
     color: "#2fb4ff",
     tags: ["gameplay", "practice"],
@@ -344,7 +349,7 @@
       audio.follow = !!this.get("audio");
       setSpeed(this.enabled() && !this.bypass ? this.get("speed") : 1);
       if (this.enabled() && this.get("showHud")) {
-        const el = hudSlot("speed", "top-left");
+        const el = hudSlot("speed", "top-center");
         if (el) el.textContent = (this.bypass ? 1 : this.get("speed")).toFixed(2) + "×";
       } else {
         removeHud("speed");
@@ -359,7 +364,7 @@
     id: "dashmods.frame-stepper",
     name: "Frame Stepper",
     version: "1.0.0",
-    author: "you",
+    author: "gd-web",
     icon: "❚❚",
     color: "#ff9f1c",
     tags: ["gameplay", "practice"],
@@ -392,7 +397,7 @@
       stepFrame(1000 / Number(this.get("stepFps")));
     },
     draw() {
-      if (this.enabled() && this.frozen) hudSlot("frozen", "top-right").textContent = "❚❚ FROZEN";
+      if (this.enabled() && this.frozen) hudSlot("frozen", "top-center-2").textContent = "❚❚ FROZEN";
       else removeHud("frozen");
     },
     onDisable() { this.frozen = false; hold("step", false); this.draw(); },
@@ -402,7 +407,7 @@
     id: "dashmods.fps-counter",
     name: "FPS Counter",
     version: "1.0.0",
-    author: "you",
+    author: "gd-web",
     icon: "60",
     color: "#2ecc71",
     tags: ["interface"],
@@ -448,7 +453,7 @@
     id: "dashmods.input-display",
     name: "Input Display",
     version: "1.0.0",
-    author: "you",
+    author: "gd-web",
     icon: "⇧",
     color: "#ff4d6d",
     tags: ["interface", "practice"],
@@ -557,13 +562,14 @@
 .dm-keybtn{min-width:96px;height:34px;border-radius:10px;border:3px solid #4a2410;background:#6e3a17;color:#fff;font:inherit;font-size:13px;cursor:pointer}
 .dm-keybtn.wait{background:#ffd54a;color:#4a2410}
 .dm-hud{position:fixed;padding:6px 10px;border-radius:10px;background:rgba(0,0,0,.45);font-size:15px;pointer-events:none;text-shadow:0 2px 0 #000}
-.dm-hud[data-pos=top-left]{top:10px;left:10px}.dm-hud[data-pos=top-right]{top:10px;right:10px}
+.dm-hud[data-pos=top-center]{top:10px;left:50%;transform:translateX(-50%)}.dm-hud[data-pos=top-center-2]{top:48px;left:50%;transform:translateX(-50%);color:#ffd54a}
+.dm-hud[data-pos=top-left]{top:10px;left:80px}.dm-hud[data-pos=top-right]{top:10px;right:10px}
 .dm-hud[data-pos=bottom-left]{bottom:76px;left:10px}.dm-hud[data-pos=bottom-right]{bottom:10px;right:10px}
 .dm-keys{display:flex;gap:6px}
 .dm-key{min-width:34px;height:30px;padding:0 8px;border-radius:8px;border:2px solid rgba(255,255,255,.6);display:grid;place-items:center;font-size:12px;background:rgba(255,255,255,.08)}
 .dm-key.wide{min-width:70px}.dm-key.on{background:#43c21f;border-color:#fff}
 .dm-stats{font-size:12px;margin-top:5px;text-align:center}
-#dm-toast{position:fixed;left:50%;top:18px;transform:translate(-50%,-20px);opacity:0;padding:8px 16px;border-radius:12px;background:rgba(0,0,0,.7);font-size:16px;transition:all .18s;pointer-events:none;text-shadow:0 2px 0 #000}
+#dm-toast{position:fixed;left:50%;top:92px;transform:translate(-50%,-20px);opacity:0;padding:8px 16px;border-radius:12px;background:rgba(0,0,0,.7);font-size:16px;transition:all .18s;pointer-events:none;text-shadow:0 2px 0 #000}
 #dm-toast.show{opacity:1;transform:translate(-50%,0)}
 .dm-empty{font-family:Arial,sans-serif;text-align:center;padding:30px;color:#ffe2b8}
 `;
@@ -750,5 +756,5 @@
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", boot);
   else boot();
 
-  window.__dashMods = { mods, clock, audio, gate, setSpeed, hold, ui, realNow };
+  window.__dashMods = { mods, clock, audio, gate, setSpeed, hold, stepFrame, ui, realNow };
 })();
