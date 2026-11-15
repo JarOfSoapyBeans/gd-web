@@ -112,6 +112,40 @@
     if (gdAudio()) { patchChPos(); clearInterval(audioPoll); }
   }, 250);
 
+  // ------------------------------------------------------------------ frame gate
+  // The engine waits for each frame in gd_js_yield_frame (gd_web.js). If the clock is
+  // stopped while the engine is running, it spins in that wait and starves the page.
+  // So freezing parks the engine inside that wait until it's unfrozen or stepped.
+  // gd_web.js is injected by setting a <script>'s textContent, so patch it there.
+  const YIELD_MARK = "function __asyncjs__gd_js_yield_frame(target_ms){return Asyncify.handleAsync(async()=>{";
+  const YIELD_HOOK = "var __dmP=window.__dmYield&&window.__dmYield(target_ms);if(__dmP)await __dmP;";
+  const tcDesc = Object.getOwnPropertyDescriptor(Node.prototype, "textContent");
+  const gate = { hooked: false, waiters: [], yields: 0, lastTarget: 0 };
+  Object.defineProperty(Node.prototype, "textContent", {
+    configurable: true,
+    enumerable: tcDesc.enumerable,
+    get() { return tcDesc.get.call(this); },
+    set(v) {
+      if (this.nodeName === "SCRIPT" && typeof v === "string" && v.indexOf(YIELD_MARK) >= 0) {
+        v = v.replace(YIELD_MARK, YIELD_MARK + YIELD_HOOK);
+        gate.hooked = true;
+        Object.defineProperty(Node.prototype, "textContent", tcDesc); // done; restore
+      }
+      tcDesc.set.call(this, v);
+    },
+  });
+  window.__dmYield = function (target) {
+    gate.yields++;
+    gate.lastTarget = target;
+    if (!clock.holds.size) return null;
+    return new Promise((res) => gate.waiters.push(res));
+  };
+  function releaseGate() {
+    const w = gate.waiters;
+    gate.waiters = [];
+    for (const f of w) f();
+  }
+
   // Time + audio together.
   function setSpeed(s) {
     rebaseClock();
@@ -119,13 +153,18 @@
     applyAudio();
   }
   function hold(reason, on) {
+    // Without the frame gate, stopping the clock would hang the page, so refuse.
+    if (on && !gate.hooked) return false;
     rebaseClock();
     if (on) clock.holds.add(reason); else clock.holds.delete(reason);
     applyAudio();
+    if (!clock.holds.size) releaseGate();
   }
   function stepFrame(ms) {
-    // Advance frozen game time by one step.
+    // Advance frozen game time by one step and let exactly one engine frame run.
+    if (!clock.holds.size) return;
     clock.baseVirt += ms;
+    releaseGate();
   }
 
   // ------------------------------------------------------------------ hotkeys
@@ -332,13 +371,18 @@
     ],
     frozen: false,
     toggle() {
+      if (!this.frozen && hold("step", true) === false) return toast("Freeze isn't available");
+      if (this.frozen) hold("step", false);
       this.frozen = !this.frozen;
-      hold("step", this.frozen);
       this.draw();
       toast(this.frozen ? "Frozen" : "Unfrozen");
     },
     step() {
-      if (!this.frozen) { this.frozen = true; hold("step", true); this.draw(); }
+      if (!this.frozen) {
+        if (hold("step", true) === false) return toast("Freeze isn't available");
+        this.frozen = true;
+        this.draw();
+      }
       stepFrame(1000 / Number(this.get("stepFps")));
     },
     draw() {
@@ -700,5 +744,5 @@
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", boot);
   else boot();
 
-  window.__dashMods = { mods, clock, audio, setSpeed, hold, ui, realNow };
+  window.__dashMods = { mods, clock, audio, gate, setSpeed, hold, ui, realNow };
 })();
