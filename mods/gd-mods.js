@@ -116,24 +116,30 @@
   // The engine waits for each frame in gd_js_yield_frame (gd_web.js). If the clock is
   // stopped while the engine is running, it spins in that wait and starves the page.
   // So freezing parks the engine inside that wait until it's unfrozen or stepped.
-  // gd_web.js is injected by setting a <script>'s textContent, so patch it there.
+  // gd_web.js is added to the page as an inline <script>, so rewrite it as it's inserted
+  // (an inline script runs when it's inserted, so this is the last moment to change it).
   const YIELD_MARK = "function __asyncjs__gd_js_yield_frame(target_ms){return Asyncify.handleAsync(async()=>{";
   const YIELD_HOOK = "var __dmP=window.__dmYield&&window.__dmYield(target_ms);if(__dmP)await __dmP;";
-  const tcDesc = Object.getOwnPropertyDescriptor(Node.prototype, "textContent");
   const gate = { hooked: false, waiters: [], yields: 0, lastTarget: 0 };
-  Object.defineProperty(Node.prototype, "textContent", {
-    configurable: true,
-    enumerable: tcDesc.enumerable,
-    get() { return tcDesc.get.call(this); },
-    set(v) {
-      if (this.nodeName === "SCRIPT" && typeof v === "string" && v.indexOf(YIELD_MARK) >= 0) {
-        v = v.replace(YIELD_MARK, YIELD_MARK + YIELD_HOOK);
-        gate.hooked = true;
-        Object.defineProperty(Node.prototype, "textContent", tcDesc); // done; restore
-      }
-      tcDesc.set.call(this, v);
-    },
-  });
+  const insertFns = { appendChild: Node.prototype.appendChild, insertBefore: Node.prototype.insertBefore };
+  function patchScript(node) {
+    if (gate.hooked || !node || node.nodeName !== "SCRIPT" || node.src) return;
+    const text = node.text;
+    if (text && text.indexOf(YIELD_MARK) >= 0) {
+      node.text = text.replace(YIELD_MARK, YIELD_MARK + YIELD_HOOK);
+      gate.hooked = true;
+      Node.prototype.appendChild = insertFns.appendChild; // done; restore
+      Node.prototype.insertBefore = insertFns.insertBefore;
+    }
+  }
+  Node.prototype.appendChild = function (node) {
+    patchScript(node);
+    return insertFns.appendChild.call(this, node);
+  };
+  Node.prototype.insertBefore = function (node, ref) {
+    patchScript(node);
+    return insertFns.insertBefore.call(this, node, ref);
+  };
   window.__dmYield = function (target) {
     gate.yields++;
     gate.lastTarget = target;
