@@ -23,7 +23,7 @@ means the proxy reached RobTop's server. A Vercel error page means the function 
 
 ## DashMods (mod menu)
 `mods/gd-mods.js` adds an in-game mod menu. Open it with **Tab** or the purple button in the
-bottom-left corner. Each mod can be switched on or off; **View → Settings** changes its options.
+right edge of the screen. Each mod can be switched on or off; **View → Settings** changes its options.
 Everything is saved in your browser.
 
 | Mod | What it does | Default keys |
@@ -32,8 +32,16 @@ Everything is saved in your browser.
 | Frame Stepper | Freezes the game and advances one frame at a time | `F` freeze, `G` step |
 | FPS Counter | Shows the game's frame rate | – |
 | Input Display | Shows jump/left/right inputs, clicks per second and total clicks | – |
+| Startpos Switcher | In online levels that contain start positions, jumps between them and restarts there | `Q` previous, `E` next |
 
 How it works: the engine reads time from `performance.now()`/`Date.now()`, so the speedhack
 scales those, plus the Web Audio playback rate and the engine's music-position function.
 Freezing holds the engine inside its per-frame wait (`gd_js_yield_frame`), which the script
 hooks when the engine's code is added to the page.
+
+Startpos Switcher: when a level downloads (`downloadGJLevel22`), every start position except the
+selected one gets the 2.2 "Disable" flag (`kA21`), the level data is padded to a fixed length and
+its checksum is recomputed. Switching overwrites that level data in the game's memory with the
+version for the new selection, then exits to the level page and presses Play (queued as the same
+input messages the page sends). Q/E only act while you're in that level, so the editor's Q/E
+rotation is unaffected. Turn the mod on before opening a level's page.

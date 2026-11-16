@@ -68,10 +68,43 @@
       node.__dmWanted = () => wanted;
       audio.sources.add(node);
       node.addEventListener("ended", () => audio.sources.delete(node));
+      const origStart = node.start;
+      node.start = function () {
+        const r = origStart.apply(node, arguments);
+        // Report only the first start of a channel: resuming from a pause restarts every
+        // paused channel (old play/quit sounds included), which must not count as new sounds.
+        if (audio.onStart.length) queueMicrotask(() => {
+          try {
+            const A = gdAudio();
+            if (!A) return;
+            let ch = null;
+            for (const id in A.channels) if (A.channels[id] && A.channels[id].src === node) { ch = A.channels[id]; break; }
+            if (!ch || seenChannels.has(ch)) return;
+            seenChannels.add(ch);
+            const name = soundName(node.buffer);
+            if (name) audio.onStart.forEach((f) => f(name));
+          } catch (e) {}
+        });
+        return r;
+      };
       return node;
     };
   }
   function gdAudio() { return window.Module && window.Module.__gdAudio; }
+  // Which game sound file a buffer belongs to ("playSound_01.ogg", ...).
+  audio.onStart = [];
+  const seenChannels = new WeakSet();
+  const bufNames = new WeakMap();
+  function soundName(buf) {
+    if (!buf) return "";
+    if (bufNames.has(buf)) return bufNames.get(buf);
+    const A = gdAudio();
+    if (A && A.sounds) for (const k in A.sounds) {
+      const s = A.sounds[k];
+      if (s && s.buf && s.name) bufNames.set(s.buf, String(s.name).split(/[\\/]/).pop());
+    }
+    return bufNames.get(buf) || "";
+  }
   function rawChPos(A, ch, f) {
     const ctx = A.ctx;
     if (!ch || !ctx) return 0;
@@ -251,7 +284,8 @@
       try { on ? mod.onEnable && mod.onEnable() : mod.onDisable && mod.onDisable(); } catch (e) { console.error(e); }
     };
     for (const hk of mod.hotkeys) {
-      hotkeys.push({ code: () => (mod.enabled() ? mod.get(hk.setting) : ""), run: hk.run });
+      // hk.when (optional): only take the key while this returns true; otherwise it goes to the game
+      hotkeys.push({ code: () => (mod.enabled() && (!hk.when || hk.when()) ? mod.get(hk.setting) : ""), run: hk.run });
     }
     mods.push(mod);
     return mod;
@@ -303,13 +337,15 @@
     settings: [
       { key: "openKey", type: "key", label: "Open menu key", default: "Tab" },
       { key: "showButton", type: "bool", label: "Show menu button", default: true,
-        help: "The small button in the bottom-left corner. You can still use the key when it's hidden." },
+        help: "You can still open the menu with the key when it's hidden." },
+      { key: "buttonPos", type: "select", label: "Menu button position", default: "right",
+        options: [["right", "Right edge tab"], ["bottom-left", "Bottom-left corner"]] },
       { key: "freezeWhileOpen", type: "bool", label: "Pause game while menu is open", default: true },
     ],
     hotkeys: [{ setting: "openKey", run: () => ui.toggle() }],
     onSetting(k) {
       // k is undefined after "Reset to defaults"
-      if (!k || k === "showButton") ui.refreshButton();
+      if (!k || k === "showButton" || k === "buttonPos") ui.refreshButton();
       if ((!k || k === "freezeWhileOpen") && ui.isOpen()) hold("menu", !!menuMod.get("freezeWhileOpen"));
     },
   });
@@ -450,6 +486,393 @@
     onSetting() { this.start(); },
   });
 
+  // ------------------------------------------------------------------ startpos switcher
+  // How it works:
+  //  1. Every downloaded level passes through fetch (downloadGJLevel22). If it has start
+  //     positions (object 31), all but the selected one get the "Disable" flag (kA21), the
+  //     level data is padded to a fixed length, and the download checksum is recomputed.
+  //  2. Switching rewrites every copy of that level data in the game's memory with the
+  //     version for the new selection (same length, so it can be overwritten in place).
+  //  3. The game only reads level data when a level starts, so the mod then pauses, exits
+  //     to the level page and presses Play, by queueing the same mouse/key messages the
+  //     page sends for real input.
+  const LV = {
+    toBytes(s) {
+      s = s.replace(/-/g, "+").replace(/_/g, "/").replace(/[^A-Za-z0-9+/]/g, "");
+      s += "=".repeat((4 - (s.length % 4)) % 4);
+      return Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
+    },
+    toB64(b) {
+      let s = "";
+      for (let i = 0; i < b.length; i += 0x8000) s += String.fromCharCode.apply(null, b.subarray(i, i + 0x8000));
+      return btoa(s).replace(/\+/g, "-").replace(/\//g, "_");
+    },
+    async inflate(bytes) {
+      // Tolerates the zero padding after the gzip data.
+      const ds = new DecompressionStream("gzip");
+      const w = ds.writable.getWriter();
+      w.write(bytes).catch(() => {}); w.close().catch(() => {});
+      const r = ds.readable.getReader(), parts = [];
+      try { for (;;) { const { value, done } = await r.read(); if (done) break; parts.push(value); } } catch (e) {}
+      let n = 0; for (const p of parts) n += p.length;
+      const out = new Uint8Array(n); let o = 0;
+      for (const p of parts) { out.set(p, o); o += p.length; }
+      return out;
+    },
+    async decode(ls) { return new TextDecoder().decode(await LV.inflate(LV.toBytes(ls))); },
+    async encode(txt) {
+      const s = new Blob([new TextEncoder().encode(txt)]).stream().pipeThrough(new CompressionStream("gzip"));
+      return LV.toB64(new Uint8Array(await new Response(s).arrayBuffer()));
+    },
+    async sha1(s) {
+      const d = await crypto.subtle.digest("SHA-1", new TextEncoder().encode(s));
+      return [...new Uint8Array(d)].map((x) => x.toString(16).padStart(2, "0")).join("");
+    },
+    hash(L) { // downloadGJLevel22 checksum
+      if (L.length < 41) return LV.sha1(L + "xI25fpAapCQg");
+      const m = Math.floor(L.length / 40); let h = "";
+      for (let i = 0; i < 40; i++) h += L[i * m];
+      return LV.sha1(h + "xI25fpAapCQg");
+    },
+    isStartPos: (o) => /^1,31(,|$)/.test(o),
+    prop(o, key) {
+      const f = o.split(",");
+      for (let i = 0; i < f.length - 1; i += 2) if (f[i] === key) return f[i + 1];
+      return null;
+    },
+    setDisabled(o, dis) {
+      const f = o.split(",");
+      for (let i = 0; i < f.length - 1; i += 2) if (f[i] === "kA21") { f[i + 1] = dis ? "1" : "0"; return f.join(","); }
+      return o + ",kA21," + (dis ? "1" : "0");
+    },
+    // Start positions in level order (by x): [{ i: object index, x }]
+    startPositions(txt) {
+      const objs = txt.split(";"), list = [];
+      for (let i = 1; i < objs.length; i++) if (LV.isStartPos(objs[i])) list.push({ i, x: Number(LV.prop(objs[i], "2")) || 0 });
+      return list.sort((a, b) => a.x - b.x);
+    },
+    // sel 0 = level start (all disabled), sel k = k-th start position enabled
+    variant(txt, list, sel) {
+      const objs = txt.split(";");
+      list.forEach((p, k) => { objs[p.i] = LV.setDisabled(objs[p.i], k + 1 !== sel); });
+      return objs.join(";");
+    },
+  };
+
+  const DB = {
+    open() {
+      if (!this.p) this.p = new Promise((res, rej) => {
+        const q = indexedDB.open("dashmods", 1);
+        q.onupgradeneeded = () => q.result.createObjectStore("levels");
+        q.onsuccess = () => res(q.result);
+        q.onerror = () => rej(q.error);
+      });
+      return this.p;
+    },
+    async get(k) { const db = await this.open(); return new Promise((res) => { const r = db.transaction("levels").objectStore("levels").get(k); r.onsuccess = () => res(r.result); r.onerror = () => res(null); }); },
+    async put(k, v) { const db = await this.open(); return new Promise((res) => { const t = db.transaction("levels", "readwrite"); t.objectStore("levels").put(v, k); t.oncomplete = () => res(true); t.onerror = () => res(false); }); },
+    async all() { const db = await this.open(); return new Promise((res) => { const r = db.transaction("levels").objectStore("levels").getAll(); r.onsuccess = () => res(r.result || []); r.onerror = () => res([]); }); },
+  };
+
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const MENU_SOUNDS = /^(menuLoop|playSound|quitSound|explode|achievement|endStart|highscoreGet|reward|counter|chest|door|unlock|gold|secret|magicExplosion|grunt|quit|crystal)/i;
+
+  const spMod = defineMod({
+    id: "dashmods.startpos-switcher",
+    name: "Startpos Switcher",
+    version: "1.0.0",
+    author: "gd-web",
+    icon: "⚑",
+    color: "#14b8a6",
+    tags: ["gameplay", "practice"],
+    short: "Use Q and E to jump between a level's start positions.",
+    desc: "For online levels that contain start positions (many practice copies do). In a level, press Q / E to go to the previous / next start position; the level restarts from there. Position 0 is the normal level start. Quick presses add up, so pressing E three times jumps three positions with one restart. Your choice is remembered per level. Progress doesn't count when you start from a start position, just like in the real game. Note: turn this on before opening a level's page, since the level is prepared while it downloads.",
+    settings: [
+      { key: "keyPrev", type: "key", label: "Previous start position key", default: "KeyQ" },
+      { key: "keyNext", type: "key", label: "Next start position key", default: "KeyE" },
+      { key: "autoRestart", type: "bool", label: "Restart automatically after switching", default: true,
+        help: "Off: switching only takes effect the next time you exit and press Play." },
+      { key: "showHud", type: "bool", label: "Show start position on screen", default: true },
+    ],
+    hotkeys: [
+      { setting: "keyPrev", when: () => spMod.canSwitch(), run: () => spMod.nudge(-1) },
+      { setting: "keyNext", when: () => spMod.canSwitch(), run: () => spMod.nudge(1) },
+    ],
+    levels: new Map(),   // id -> level record (this session)
+    active: null,        // level record the player is in
+    inLevel: false,
+    currentSong: "",
+    pendingSel: null,
+    busy: false,
+    timer: 0,
+
+    // ---- level records
+    async record(id, name, song, txt, sel, padTo) {
+      const list = LV.startPositions(txt);
+      const lv = { id, name, song, txt, list, n: list.length, sel: Math.min(sel || 0, list.length), padTo, variants: new Map() };
+      this.levels.set(id, lv);
+      return lv;
+    },
+    async variantStr(lv, sel) {
+      if (lv.variants.has(sel)) return lv.variants.get(sel);
+      let s = await LV.encode(LV.variant(lv.txt, lv.list, sel));
+      if (s.length > lv.padTo) return null;
+      s += "A".repeat(lv.padTo - s.length);
+      lv.variants.set(sel, s);
+      return s;
+    },
+    persist(lv) {
+      DB.put(String(lv.id), { id: lv.id, name: lv.name, song: lv.song, txt: lv.txt, sel: lv.sel, padTo: lv.padTo, t: Date.now() });
+    },
+
+    // ---- download rewrite (called from the fetch wrapper)
+    async rewrite(text) {
+      const cut = text.indexOf("#");
+      const main = cut >= 0 ? text.slice(0, cut) : text;
+      const hashes = cut >= 0 ? text.slice(cut + 1).split("#") : [];
+      const parts = main.split(":");
+      if (parts.length < 4) return text;
+      const d = {};
+      for (let i = 0; i + 1 < parts.length; i += 2) d[parts[i]] = parts[i + 1];
+      if (!d["1"] || !d["4"]) return text;
+      const txt = await LV.decode(d["4"]);
+      if (!txt || !LV.startPositions(txt).length) return text;
+      const id = d["1"];
+      const saved = await DB.get(String(id)).catch(() => null);
+      const sel = saved && saved.txt === txt ? saved.sel : 0;
+      const base = await LV.encode(txt);
+      const padTo = base.length + 512 + Math.ceil(base.length * 0.02);
+      const lv = await this.record(id, d["2"] || "", saved && saved.txt === txt ? saved.song : "", txt, sel, padTo);
+      const ls = await this.variantStr(lv, lv.sel);
+      if (!ls) return text;
+      let out = "";
+      for (let i = 0; i + 1 < parts.length; i += 2) out += (i ? ":" : "") + parts[i] + ":" + (parts[i] === "4" ? ls : parts[i + 1]);
+      if (hashes.length) hashes[0] = await LV.hash(ls);
+      lv.fresh = !lv.song;
+      this.active = lv;
+      this.persist(lv);
+      console.log(`[DashMods] startpos: level ${id} has ${lv.n} start positions; using ${lv.sel}`);
+      return [out].concat(hashes).join("#");
+    },
+
+    // ---- memory
+    findCopies(lv, strings) {
+      // One pass over the game's memory: find the shared start of our versions of this
+      // level, then check which version (if any) is stored at each hit.
+      const H = window.HEAPU8;
+      if (!H || !strings.length) return [];
+      let pre = strings[0];
+      for (const s of strings) { let k = 0; while (k < pre.length && k < s.length && pre[k] === s[k]) k++; pre = pre.slice(0, k); }
+      pre = pre.slice(0, 64);
+      if (pre.length < 8) pre = strings[0].slice(0, 8);
+      const KEY = Math.min(96, lv.padTo);
+      const byKey = new Map();
+      for (const s of strings) { const k = s.slice(0, KEY); if (!byKey.has(k)) byKey.set(k, []); byKey.get(k).push(s); }
+      const dec = new TextDecoder("latin1"), CH = 32 << 20, hits = [];
+      for (let off = 0; off < H.length; off += CH - KEY) {
+        const chunk = dec.decode(H.subarray(off, Math.min(H.length, off + CH)));
+        for (let i = chunk.indexOf(pre); i >= 0; i = chunk.indexOf(pre, i + 1)) {
+          const p = off + i;
+          if (hits.length && hits[hits.length - 1].p === p) continue;
+          if (p + lv.padTo > H.length) continue;
+          const head = dec.decode(H.subarray(p, p + KEY));
+          const cands = byKey.get(head);
+          if (!cands) continue;
+          for (const s of cands) {
+            let ok = true;
+            for (let k = KEY; k < s.length; k++) if (H[p + k] !== s.charCodeAt(k)) { ok = false; break; }
+            if (ok) { hits.push({ p, s }); break; }
+          }
+        }
+      }
+      return hits;
+    },
+    async allVariants(lv) {
+      const out = [];
+      for (let k = 0; k <= lv.n; k++) { const s = await this.variantStr(lv, k); if (s) out.push(s); }
+      return out;
+    },
+    async writeSel(lv, sel) {
+      const target = await this.variantStr(lv, sel);
+      if (!target) return 0;
+      const hits = this.findCopies(lv, await this.allVariants(lv));
+      const H = window.HEAPU8;
+      for (const h of hits) for (let k = 0; k < target.length; k++) H[h.p + k] = target.charCodeAt(k);
+      return hits.length;
+    },
+
+    // ---- which level is being played
+    onSound(name) {
+      if (/^playSound/i.test(name)) { this.inLevel = true; this.lastPlay = realNow(); }
+      else if (/^quitSound/i.test(name)) this.inLevel = false;
+      this.draw();
+    },
+    // The level's song: the newest live audio channel that isn't a menu sound or effect.
+    songNow() {
+      const A = gdAudio();
+      if (!A) return { name: "", ch: null };
+      let best = null, bestId = -1;
+      for (const id in A.channels) {
+        const c = A.channels[id], s = c && A.sounds[c.sound];
+        if (!s || c.ended || !s.name || (s.len || 0) < 15000) continue;
+        const name = String(s.name).split(/[\\/]/).pop();
+        if (MENU_SOUNDS.test(name)) continue;
+        if (Number(id) > bestId) { bestId = Number(id); best = { name, ch: c }; }
+      }
+      return best || { name: "", ch: null };
+    },
+    curSong() { return this.inLevel ? this.songNow().name : ""; },
+    matches(lv) {
+      if (!lv || !this.inLevel) return false;
+      const song = this.curSong();
+      if (lv.song && song) return lv.song === song;
+      if (!lv.song && song && lv.fresh) { lv.song = song; this.knownSongs.add(song); this.persist(lv); }
+      return true;
+    },
+    canSwitch() {
+      if (!this.inLevel || ui.isOpen()) return false;
+      if (this.active && this.matches(this.active)) return true;
+      // Level loaded from an earlier session's save: allowed if we know a level with this song.
+      return !!this.curSong() && this.knownSongs.has(this.curSong());
+    },
+    knownSongs: new Set(),
+    async findActiveFromStorage() {
+      const all = (await DB.all()).filter((r) => r.song === this.curSong()).sort((a, b) => b.t - a.t).slice(0, 4);
+      for (const r of all) {
+        const lv = this.levels.get(r.id) || await this.record(r.id, r.name, r.song, r.txt, r.sel, r.padTo);
+        const hits = this.findCopies(lv, await this.allVariants(lv));
+        if (hits.length) {
+          const s = hits[0].s;
+          for (const [k, v] of lv.variants) if (v === s) lv.sel = k;
+          this.active = lv;
+          return lv;
+        }
+      }
+      return null;
+    },
+
+    // ---- switching
+    nudge(d) {
+      const lv = this.active && this.matches(this.active) ? this.active : null;
+      const n = lv ? lv.n : 0;
+      const base = this.pendingSel != null ? this.pendingSel : lv ? lv.sel : 0;
+      this.pendingSel = lv ? ((base + d) % (n + 1) + n + 1) % (n + 1) : d;
+      this.pendingDelta = (this.pendingDelta || 0) + d;
+      this.draw();
+      clearTimeout(this.timer);
+      this.timer = setTimeout(() => this.apply(), 350);
+    },
+    async apply() {
+      if (this.busy) { this.timer = setTimeout(() => this.apply(), 200); return; }
+      this.busy = true;
+      try {
+        let lv = this.active && this.matches(this.active) ? this.active : null;
+        if (!lv) {
+          toast("Finding this level…");
+          await sleep(30);
+          lv = await this.findActiveFromStorage();
+          if (!lv) { toast("No start positions known for this level"); return; }
+          const n = lv.n;
+          this.pendingSel = ((lv.sel + (this.pendingDelta || 0)) % (n + 1) + n + 1) % (n + 1);
+        }
+        const sel = this.pendingSel;
+        if (sel == null || sel === lv.sel) return;
+        if (clock.holds.size) { toast("Unfreeze the game first"); return; }
+        toast("Switching to " + this.label(lv, sel) + "…");
+        await sleep(30); // let the toast paint; the memory search blocks for a moment
+        const n = await this.writeSel(lv, sel);
+        if (!n) { toast("Couldn't find this level in memory. Re-open its page and try again"); return; }
+        lv.sel = sel;
+        this.persist(lv);
+        if (this.get("autoRestart")) await this.restart();
+        else toast(this.label(lv, sel) + " – exit and press Play to use it");
+      } catch (e) {
+        console.error("[DashMods] startpos", e);
+        toast("Start position switch failed");
+      } finally {
+        this.pendingSel = null; this.pendingDelta = 0; this.busy = false; this.draw();
+      }
+    },
+    // The pause menu pauses whole audio groups (music and effects); dying only pauses the
+    // song's channel for a moment, so check the groups.
+    pauseMenuOpen() {
+      const A = gdAudio();
+      if (!A || !A.groups) return false;
+      for (const k in A.groups) if (A.groups[k] && A.groups[k].paused) return true;
+      return false;
+    },
+    async restart() {
+      const M = window.Module;
+      const slow = 1 / Math.max(0.1, clock.speed); // menu transitions run on game time
+      const click = async (fx, fy) => {
+        const x = Math.round(fx * 1919), y = Math.round(fy * 1079), lp = (x & 0xffff) | (y << 16);
+        M.gdCursorPos = [x, y];
+        M.gdInputQueue.push([0x200, 0, lp]); await sleep(50);
+        M.gdInputQueue.push([0x201, 1, lp]); await sleep(80);
+        M.gdInputQueue.push([0x202, 0, lp]);
+      };
+      const esc = async () => {
+        M.gdInputQueue.push([0x100, 27, 0x00010001]); await sleep(80);
+        M.gdInputQueue.push([0x101, 27, 0xc0010001 | 0]);
+      };
+      const until = async (cond, ms) => { for (let t = 0; t < ms && !cond(); t += 50) await sleep(50); return cond(); };
+      // Esc pauses; Esc again in the pause menu exits to the level page. Each step waits for
+      // the game to actually get there, since menu animations take longer on slow machines.
+      if (!this.pauseMenuOpen()) {
+        await esc();
+        await until(() => this.pauseMenuOpen(), 2500 * slow);
+        await sleep(250 * slow);
+      }
+      for (let tries = 0; tries < 2 && this.inLevel; tries++) {
+        await esc();
+        await until(() => !this.inLevel, 3500 * slow);
+      }
+      if (this.inLevel) { toast("Couldn't restart automatically – exit and press Play"); return; }
+      await sleep(900 * slow);     // level page fades in
+      const before = this.lastPlay || 0;
+      await click(0.5, 0.342);     // level page: Play
+      await until(() => (this.lastPlay || 0) !== before, 3000 * slow);
+      if ((this.lastPlay || 0) === before) toast("Couldn't restart automatically – exit and press Play");
+    },
+
+    // ---- display
+    label(lv, sel) { return sel === 0 ? "Level start" : `Start pos ${sel}/${lv.n}`; },
+    draw() {
+      const lv = this.active;
+      const show = this.enabled() && this.get("showHud") && lv && this.matches(lv);
+      if (!show) return removeHud("startpos");
+      const sel = this.pendingSel != null ? this.pendingSel : lv.sel;
+      const el = hudSlot("startpos", "bottom-center");
+      if (el) el.textContent = "⚑ " + this.label(lv, sel) + (this.pendingSel != null ? " …" : "") + "   Q ◀ ▶ E";
+    },
+    onEnable() { this.draw(); },
+    onDisable() { removeHud("startpos"); },
+    onSetting() { this.draw(); },
+  });
+  audio.onStart.push((name) => spMod.onSound(name));
+  DB.all().then((rs) => rs.forEach((r) => r.song && spMod.knownSongs.add(r.song))).catch(() => {});
+
+  // Rewrite level downloads. Installed before the page's own proxy wrapper, which then
+  // calls this one, so it sees the final proxied request.
+  const nativeFetch = window.fetch;
+  window.fetch = async function (input) {
+    const res = await nativeFetch.apply(this, arguments);
+    try {
+      const url = String((input && input.url) || input);
+      if (!spMod.enabled() || !/downloadGJLevel22/.test(url) || !res.ok) return res;
+      const text = await res.clone().text();
+      const out = await spMod.rewrite(text);
+      if (out === text) return res;
+      if (spMod.active && spMod.active.song) spMod.knownSongs.add(spMod.active.song);
+      const headers = new Headers(res.headers);
+      headers.delete("content-length"); headers.delete("content-encoding");
+      return new Response(out, { status: res.status, statusText: res.statusText, headers });
+    } catch (e) {
+      console.error("[DashMods] startpos rewrite failed", e);
+      return res;
+    }
+  };
+
   const JUMP_KEYS = ["Space", "ArrowUp", "KeyW"];
   const LEFT_KEYS = ["ArrowLeft", "KeyA"];
   const RIGHT_KEYS = ["ArrowRight", "KeyD"];
@@ -525,6 +948,9 @@
 #dm-btn{position:fixed;left:14px;bottom:14px;width:52px;height:52px;border-radius:14px;border:3px solid #1d1036;background:linear-gradient(#9b7bff,#5a37d6);box-shadow:0 4px 0 #1d1036,inset 0 2px 0 rgba(255,255,255,.35);pointer-events:auto;cursor:pointer;display:grid;place-items:center;opacity:.55;transition:opacity .15s,transform .1s}
 #dm-btn:hover{opacity:1}#dm-btn:active{transform:translateY(2px);box-shadow:0 2px 0 #1d1036}
 #dm-btn svg{width:30px;height:30px}
+#dm-btn[data-pos=right]{left:auto;bottom:auto;right:0;top:42%;width:18px;height:64px;border-radius:12px 0 0 12px;border-right:0;box-shadow:inset 0 2px 0 rgba(255,255,255,.35);opacity:.6}
+#dm-btn[data-pos=right] svg{width:13px;height:13px}
+#dm-btn[data-pos=right]:active{transform:none}
 #dm-shade{position:fixed;inset:0;background:rgba(0,0,0,.55);pointer-events:auto;display:none}
 #dm-shade.open{display:block}
 .dm-panel{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);background:linear-gradient(#c97a3f,#a95f2c);border:4px solid #4a2410;border-radius:22px;box-shadow:0 8px 0 rgba(0,0,0,.35),inset 0 3px 0 rgba(255,255,255,.25);pointer-events:auto;display:flex;flex-direction:column}
@@ -567,8 +993,8 @@
 .dm-keybtn.wait{background:#ffd54a;color:#4a2410}
 .dm-hud{position:fixed;padding:6px 10px;border-radius:10px;background:rgba(0,0,0,.45);font-size:15px;pointer-events:none;text-shadow:0 2px 0 #000}
 .dm-hud[data-pos=top-center]{top:10px;left:50%;transform:translateX(-50%)}.dm-hud[data-pos=top-center-2]{top:48px;left:50%;transform:translateX(-50%);color:#ffd54a}
-.dm-hud[data-pos=top-left]{top:10px;left:80px}.dm-hud[data-pos=top-right]{top:10px;right:10px}
-.dm-hud[data-pos=bottom-left]{bottom:76px;left:10px}.dm-hud[data-pos=bottom-right]{bottom:10px;right:10px}
+.dm-hud[data-pos=top-left]{top:10px;left:80px}.dm-hud[data-pos=bottom-center]{bottom:14px;left:50%;transform:translateX(-50%);white-space:nowrap}.dm-hud[data-pos=top-right]{top:10px;right:10px}
+.dm-hud[data-pos=bottom-left]{bottom:10px;left:10px}.dm-hud[data-pos=bottom-right]{bottom:10px;right:10px}
 .dm-keys{display:flex;gap:6px}
 .dm-key{min-width:34px;height:30px;padding:0 8px;border-radius:8px;border:2px solid rgba(255,255,255,.6);display:grid;place-items:center;font-size:12px;background:rgba(255,255,255,.08)}
 .dm-key.wide{min-width:70px}.dm-key.on{background:#43c21f;border-color:#fff}
@@ -599,7 +1025,11 @@
       this.root.appendChild(this.btn);
       this.refreshButton();
     },
-    refreshButton() { if (this.btn) this.btn.style.display = menuMod.get("showButton") ? "" : "none"; },
+    refreshButton() {
+      if (!this.btn) return;
+      this.btn.style.display = menuMod.get("showButton") ? "" : "none";
+      this.btn.dataset.pos = menuMod.get("buttonPos");
+    },
     isOpen() { return this.stack.length > 0; },
     toggle() { this.isOpen() ? this.closeAll() : this.openMain(); },
     push(el) {
