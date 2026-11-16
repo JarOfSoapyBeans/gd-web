@@ -33,6 +33,7 @@ Everything is saved in your browser.
 | FPS Counter | Shows the game's frame rate | – |
 | Input Display | Shows jump/left/right inputs, clicks per second and total clicks | – |
 | Startpos Switcher | In online levels that contain start positions, jumps between them and restarts there | `Q` previous, `E` next |
+| Smooth Autosave (on by default) | Holds the 10-second autosave while you're playing a level; saves on pause, leaving the level, switching tabs, or every 3 minutes | – |
 
 How it works: the engine reads time from `performance.now()`/`Date.now()`, so the speedhack
 scales those, plus the Web Audio playback rate and the engine's music-position function.
@@ -44,4 +45,6 @@ selected one gets the 2.2 "Disable" flag (`kA21`), the level data is padded to a
 its checksum is recomputed. Switching overwrites that level data in the game's memory with the
 version for the new selection, then exits to the level page and presses Play (queued as the same
 input messages the page sends). Q/E only act while you're in that level, so the editor's Q/E
-rotation is unaffected. Turn the mod on before opening a level's page.
+rotation is unaffected. Turn the mod on before opening a level's page. During a switch the game
+clock runs ~6x (menu fades run on game time) under a cover screen, and the level data's memory
+location is found in the background while you play so switches don't have to search again.

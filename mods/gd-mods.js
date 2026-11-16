@@ -193,7 +193,7 @@
   // Time + audio together.
   function setSpeed(s) {
     rebaseClock();
-    clock.speed = Math.max(0.05, Math.min(5, s));
+    clock.speed = Math.max(0.05, Math.min(10, s));
     applyAudio();
   }
   function hold(reason, on) {
@@ -656,6 +656,56 @@
     },
 
     // ---- memory
+    matcher(lv, strings) {
+      let pre = strings[0];
+      for (const s of strings) { let k = 0; while (k < pre.length && k < s.length && pre[k] === s[k]) k++; pre = pre.slice(0, k); }
+      pre = pre.slice(0, 64);
+      if (pre.length < 8) pre = strings[0].slice(0, 8);
+      const KEY = Math.min(96, lv.padTo);
+      const byKey = new Map();
+      for (const s of strings) { const k = s.slice(0, KEY); if (!byKey.has(k)) byKey.set(k, []); byKey.get(k).push(s); }
+      const dec = new TextDecoder("latin1");
+      // which of our versions is stored at address p (or null)
+      const at = (H, p) => {
+        if (p < 0 || p + lv.padTo > H.length) return null;
+        const cands = byKey.get(dec.decode(H.subarray(p, p + KEY)));
+        if (!cands) return null;
+        for (const s of cands) {
+          let ok = true;
+          for (let k = KEY; k < s.length; k++) if (H[p + k] !== s.charCodeAt(k)) { ok = false; break; }
+          if (ok) return s;
+        }
+        return null;
+      };
+      return { pre, KEY, at, dec };
+    },
+    // Scan memory a slice at a time while the game is idle, so it doesn't cause lag.
+    async scanInBackground(lv) {
+      if (lv.scanning) return lv.scanning;
+      const gen = (lv.gen = (lv.gen || 0) + 1);
+      lv.scanning = (async () => {
+        const strings = await this.allVariants(lv);
+        const H0 = window.HEAPU8;
+        if (!H0 || !strings.length) return;
+        const m = this.matcher(lv, strings), SL = 4 << 20, found = [];
+        const idle = () => new Promise((r) => (window.requestIdleCallback ? requestIdleCallback(r, { timeout: 500 }) : setTimeout(r, 16)));
+        for (let off = 0; off < H0.length; ) {
+          const dl = await idle();
+          do {
+            const H = window.HEAPU8;
+            const chunk = m.dec.decode(H.subarray(off, Math.min(H.length, off + SL)));
+            for (let i = chunk.indexOf(m.pre); i >= 0; i = chunk.indexOf(m.pre, i + 1)) {
+              const p = off + i;
+              if (found.includes(p)) continue;
+              if (m.at(H, p)) found.push(p);
+            }
+            off += SL - m.KEY;
+          } while (off < H0.length && dl && dl.timeRemaining && dl.timeRemaining() > 6);
+        }
+        if (lv.gen === gen) lv.cache = found;
+      })().finally(() => { lv.scanning = null; });
+      return lv.scanning;
+    },
     findCopies(lv, strings) {
       // One pass over the game's memory: find the shared start of our versions of this
       // level, then check which version (if any) is stored at each hit.
@@ -695,15 +745,30 @@
     async writeSel(lv, sel) {
       const target = await this.variantStr(lv, sel);
       if (!target) return 0;
-      const hits = this.findCopies(lv, await this.allVariants(lv));
+      const strings = await this.allVariants(lv);
       const H = window.HEAPU8;
-      for (const h of hits) for (let k = 0; k < target.length; k++) H[h.p + k] = target.charCodeAt(k);
-      return hits.length;
+      // Fast path: addresses found by an earlier scan (still holding one of our versions).
+      let addrs = [];
+      if (lv.cache && lv.cache.length) {
+        const m = this.matcher(lv, strings);
+        addrs = lv.cache.filter((p) => m.at(H, p));
+      }
+      if (!addrs.length) addrs = this.findCopies(lv, strings).map((h) => h.p);
+      for (const p of addrs) for (let k = 0; k < target.length; k++) H[p + k] = target.charCodeAt(k);
+      lv.gen = (lv.gen || 0) + 1;   // a background search still running is now out of date
+      lv.cache = addrs;
+      return addrs.length;
     },
 
     // ---- which level is being played
     onSound(name) {
-      if (/^playSound/i.test(name)) { this.inLevel = true; this.lastPlay = realNow(); }
+      if (/^playSound/i.test(name)) {
+        this.inLevel = true; this.lastPlay = realNow();
+        if (this.fast) this.endFast();
+        // Find the level data in memory now (in idle time) so the first switch is quick.
+        const lv = this.active;
+        if (this.enabled() && lv && !(lv.cache && lv.cache.length)) setTimeout(() => { if (this.matches(lv)) this.scanInBackground(lv); }, 1500);
+      }
       else if (/^quitSound/i.test(name)) this.inLevel = false;
       this.draw();
     },
@@ -760,7 +825,7 @@
       this.pendingDelta = (this.pendingDelta || 0) + d;
       this.draw();
       clearTimeout(this.timer);
-      this.timer = setTimeout(() => this.apply(), 350);
+      this.timer = setTimeout(() => this.apply(), 200);
     },
     async apply() {
       if (this.busy) { this.timer = setTimeout(() => this.apply(), 200); return; }
@@ -793,16 +858,48 @@
         this.pendingSel = null; this.pendingDelta = 0; this.busy = false; this.draw();
       }
     },
-    // The pause menu pauses whole audio groups (music and effects); dying only pauses the
-    // song's channel for a moment, so check the groups.
+    // The pause menu pauses the music's audio group. (Other groups can stay flagged as paused
+    // after a restart, and dying only pauses the song's own channel, so check just that one.)
     pauseMenuOpen() {
       const A = gdAudio();
       if (!A || !A.groups) return false;
-      for (const k in A.groups) if (A.groups[k] && A.groups[k].paused) return true;
-      return false;
+      const { ch } = this.songNow();
+      const g = A.groups[ch && ch.group != null ? ch.group : 1];
+      return !!(g && g.paused);
+    },
+    // During a switch, run the game clock fast (menu fades run on game time) and cover the
+    // screen, then put everything back as soon as the level starts again.
+    startFast(text) {
+      this.fast = { speed: clock.speed, follow: audio.follow };
+      audio.follow = false;
+      setSpeed(Math.min(10, Math.max(1, clock.speed) * 6));
+      let ov = document.getElementById("dm-switch");
+      if (!ov) {
+        ov = document.createElement("div");
+        ov.id = "dm-switch";
+        ov.className = "dm-out";
+        ui.root.appendChild(ov);
+      }
+      ov.textContent = "⚑ " + text;
+      ov.classList.add("show");
+    },
+    endFast() {
+      const f = this.fast;
+      if (!f) return;
+      this.fast = null;
+      audio.follow = f.follow;
+      setSpeed(f.speed);
+      const ov = document.getElementById("dm-switch");
+      if (ov) setTimeout(() => { if (!this.fast) ov.classList.remove("show"); }, 120);
     },
     async restart() {
       const M = window.Module;
+      this.startFast(this.label(this.active, this.active.sel));
+      try { await this.restartSteps(M); } finally { setTimeout(() => this.endFast(), 400); }
+    },
+    async restartSteps(M) {
+      const t0 = realNow(), tl = (this.timeline = []);
+      const mark = (what) => tl.push([what, Math.round(realNow() - t0)]);
       const slow = 1 / Math.max(0.1, clock.speed); // menu transitions run on game time
       const click = async (fx, fy) => {
         const x = Math.round(fx * 1919), y = Math.round(fy * 1079), lp = (x & 0xffff) | (y << 16);
@@ -820,18 +917,21 @@
       // the game to actually get there, since menu animations take longer on slow machines.
       if (!this.pauseMenuOpen()) {
         await esc();
-        await until(() => this.pauseMenuOpen(), 2500 * slow);
+        await until(() => this.pauseMenuOpen(), 3000);
+        mark("paused:" + this.pauseMenuOpen());
         await sleep(250 * slow);
       }
       for (let tries = 0; tries < 2 && this.inLevel; tries++) {
         await esc();
-        await until(() => !this.inLevel, 3500 * slow);
+        await until(() => !this.inLevel, 4000);
+        mark("exit try " + tries + ": left=" + !this.inLevel);
       }
       if (this.inLevel) { toast("Couldn't restart automatically – exit and press Play"); return; }
       await sleep(900 * slow);     // level page fades in
       const before = this.lastPlay || 0;
       await click(0.5, 0.342);     // level page: Play
-      await until(() => (this.lastPlay || 0) !== before, 3000 * slow);
+      await until(() => (this.lastPlay || 0) !== before, 5000);
+      mark("replayed:" + ((this.lastPlay || 0) !== before));
       if ((this.lastPlay || 0) === before) toast("Couldn't restart automatically – exit and press Play");
     },
 
@@ -851,6 +951,51 @@
   });
   audio.onStart.push((name) => spMod.onSound(name));
   DB.all().then((rs) => rs.forEach((r) => r.song && spMod.knownSongs.add(r.song))).catch(() => {});
+
+  // ------------------------------------------------------------------ smooth autosave
+  // The page asks the game to save every 10 seconds. Geometry Dash encodes and compresses
+  // its whole save file (including every downloaded level) to do that, which freezes a
+  // frame or more, so while you're playing a level the save waits until you pause, leave
+  // the level, switch tabs, or 3 minutes have passed.
+  const saveMod = defineMod({
+    id: "dashmods.smooth-autosave",
+    name: "Smooth Autosave",
+    version: "1.0.0",
+    author: "gd-web",
+    icon: "💾",
+    color: "#64748b",
+    tags: ["performance"],
+    defaultEnabled: true,
+    short: "Stops the 10-second autosave from causing lag spikes while you play.",
+    desc: "The game saves every 10 seconds, and with big levels downloaded each save can freeze the game for a moment. With this on, saving waits while you're playing a level and happens as soon as you pause, leave the level, switch tabs or close the page (or after 3 minutes at most).",
+    settings: [],
+    pending: false,
+    lastSave: 0,
+    allowedNow() {
+      return document.visibilityState === "hidden" || !spMod.inLevel || spMod.pauseMenuOpen() || realNow() - this.lastSave > 180000;
+    },
+  });
+  (function hookSave() {
+    // The engine replaces its exported functions during start-up, so wait until the game
+    // has started, and re-apply the hook if it's ever replaced again.
+    const M = window.Module;
+    if (!M || !window.__gdGameStarted || typeof M._gd_request_save !== "function") return setTimeout(hookSave, 500);
+    let orig = null;
+    const wrapper = function () {
+      if (saveMod.enabled() && !saveMod.allowedNow()) { saveMod.pending = true; return; }
+      saveMod.pending = false;
+      saveMod.lastSave = realNow();
+      return orig.apply(this, arguments);
+    };
+    const install = () => { if (M._gd_request_save !== wrapper) { orig = M._gd_request_save; M._gd_request_save = wrapper; } };
+    install();
+    saveMod.lastSave = realNow();
+    setInterval(() => {
+      install();
+      if (saveMod.pending && (!saveMod.enabled() || saveMod.allowedNow())) M._gd_request_save();
+    }, 500);
+    document.addEventListener("visibilitychange", () => { if (saveMod.pending && document.visibilityState === "hidden") M._gd_request_save(); });
+  })();
 
   // Rewrite level downloads. Installed before the page's own proxy wrapper, which then
   // calls this one, so it sees the final proxied request.
@@ -1001,6 +1146,8 @@
 .dm-stats{font-size:12px;margin-top:5px;text-align:center}
 #dm-toast{position:fixed;left:50%;top:92px;transform:translate(-50%,-20px);opacity:0;padding:8px 16px;border-radius:12px;background:rgba(0,0,0,.7);font-size:16px;transition:all .18s;pointer-events:none;text-shadow:0 2px 0 #000}
 #dm-toast.show{opacity:1;transform:translate(-50%,0)}
+#dm-switch{position:fixed;inset:0;display:grid;place-items:center;background:rgba(10,16,40,.92);font-size:30px;opacity:0;pointer-events:none;transition:opacity .08s}
+#dm-switch.show{opacity:1}
 .dm-empty{font-family:Arial,sans-serif;text-align:center;padding:30px;color:#ffe2b8}
 `;
 
