@@ -912,25 +912,30 @@
         M.gdInputQueue.push([0x100, 27, 0x00010001]); await sleep(80);
         M.gdInputQueue.push([0x101, 27, 0xc0010001 | 0]);
       };
-      const until = async (cond, ms) => { for (let t = 0; t < ms && !cond(); t += 50) await sleep(50); return cond(); };
+      const until = async (cond, ms) => { const end = realNow() + ms; while (!cond() && realNow() < end) await sleep(40); return cond(); };
       // Esc pauses; Esc again in the pause menu exits to the level page. Each step waits for
       // the game to actually get there, since menu animations take longer on slow machines.
       if (!this.pauseMenuOpen()) {
         await esc();
         await until(() => this.pauseMenuOpen(), 3000);
         mark("paused:" + this.pauseMenuOpen());
-        await sleep(250 * slow);
+        await sleep(300);   // real time: right after a level starts the pause menu needs a moment before Esc works
       }
-      for (let tries = 0; tries < 2 && this.inLevel; tries++) {
+      // If the game wasn't actually paused, the first Esc only pauses it; a short first wait
+      // keeps that case quick before the second Esc.
+      for (let tries = 0; tries < 3 && this.inLevel; tries++) {
         await esc();
-        await until(() => !this.inLevel, 4000);
+        await until(() => !this.inLevel, tries === 0 ? 1500 : 4000);
         mark("exit try " + tries + ": left=" + !this.inLevel);
       }
       if (this.inLevel) { toast("Couldn't restart automatically – exit and press Play"); return; }
-      await sleep(900 * slow);     // level page fades in
+      await sleep(Math.max(900 * slow, 400));     // level page fades in
       const before = this.lastPlay || 0;
-      await click(0.5, 0.342);     // level page: Play
-      await until(() => (this.lastPlay || 0) !== before, 5000);
+      // Play; if the click lands before the page is ready, click again (still on the level page).
+      for (let tries = 0; tries < 3 && (this.lastPlay || 0) === before; tries++) {
+        await click(0.5, 0.342);
+        await until(() => (this.lastPlay || 0) !== before, tries < 2 ? 1500 : 4000);
+      }
       mark("replayed:" + ((this.lastPlay || 0) !== before));
       if ((this.lastPlay || 0) === before) toast("Couldn't restart automatically – exit and press Play");
     },
