@@ -27,6 +27,42 @@
     }, 150);
   }
 
+  // ------------------------------------------------------------------ blocked-song cleanup
+  // Newgrounds answers blocked downloads with a short "hotlinking disabled" clip (always the
+  // same 41,796-byte file). The game saves downloaded songs in IndexedDB, so a clip saved
+  // before the fix kept playing. Remove any saved copy of that clip before the game restores
+  // its files (the song then shows as not downloaded and can be downloaded again).
+  const NG_CLIP = { size: 41796, sha1: "fd2ee6296668da16f1fc1a80eb402eb824083f6b" };
+  async function isNgClip(bytes) {
+    if (!bytes || bytes.byteLength !== NG_CLIP.size) return false;
+    const d = await crypto.subtle.digest("SHA-1", bytes);
+    return [...new Uint8Array(d)].map((x) => x.toString(16).padStart(2, "0")).join("") === NG_CLIP.sha1;
+  }
+  const removedClips = [];
+  try {
+    // Same version and store as the game uses, so opening it here never leaves it half set up.
+    const q = indexedDB.open("gdwasm_saves", 1);
+    q.onupgradeneeded = () => q.result.createObjectStore("files");
+    q.onsuccess = () => {
+      const db = q.result, found = [];
+      const tx = db.transaction("files", "readonly");
+      tx.objectStore("files").openCursor().onsuccess = (e) => {
+        const c = e.target.result;
+        if (!c) return;
+        if (/\.(mp3|ogg)$/i.test(String(c.key)) && c.value && c.value.byteLength === NG_CLIP.size) found.push([c.key, c.value]);
+        c.continue();
+      };
+      tx.oncomplete = async () => {
+        const bad = [];
+        for (const [k, v] of found) if (await isNgClip(v)) bad.push(k);
+        if (!bad.length) return db.close();
+        const del = db.transaction("files", "readwrite");
+        for (const k of bad) del.objectStore("files").delete(k);
+        del.oncomplete = () => { db.close(); removedClips.push(...bad); console.log("[DashMods] removed blocked song clips:", bad); };
+      };
+    };
+  } catch (e) {}
+
   // ------------------------------------------------------------------ clock
   const realNow = performance.now.bind(performance);
   const realDateNow = Date.now.bind(Date);
@@ -1009,6 +1045,13 @@
     const res = await nativeFetch.apply(this, arguments);
     try {
       const url = String((input && input.url) || input);
+      const len = res.headers.get("content-length");
+      if (res.ok && /audio|ngfiles|\.mp3|\/ext\//i.test(url) && (len === String(NG_CLIP.size) || (len == null && !/downloadGJ|\.php/i.test(url)))) {
+        if (await isNgClip(await res.clone().arrayBuffer())) {
+          console.warn("[DashMods] blocked-song clip from", url, "- treating as a failed download");
+          return new Response("hotlink clip", { status: 502 });
+        }
+      }
       if (!spMod.enabled() || !/downloadGJLevel22/.test(url) || !res.ok) return res;
       const text = await res.clone().text();
       const out = await spMod.rewrite(text);
@@ -1335,6 +1378,9 @@
   // ------------------------------------------------------------------ start
   function boot() {
     ui.build();
+    setTimeout(() => {
+      if (removedClips.length) toast(`Removed ${removedClips.length} broken song download${removedClips.length > 1 ? "s" : ""} – download ${removedClips.length > 1 ? "them" : "it"} again`);
+    }, 4000);
     for (const m of mods) if (m.enabled() && !m.locked && m.onEnable) {
       try { m.onEnable(); } catch (e) { console.error("[DashMods]", m.id, e); }
     }
