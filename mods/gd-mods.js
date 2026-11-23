@@ -598,15 +598,17 @@
   const DB = {
     open() {
       if (!this.p) this.p = new Promise((res, rej) => {
-        const q = indexedDB.open("dashmods", 1);
-        q.onupgradeneeded = () => q.result.createObjectStore("levels");
+        const q = indexedDB.open("dashmods", 2);
+        q.onupgradeneeded = () => {
+          for (const name of ["levels", "backups"]) if (!q.result.objectStoreNames.contains(name)) q.result.createObjectStore(name);
+        };
         q.onsuccess = () => res(q.result);
         q.onerror = () => rej(q.error);
       });
       return this.p;
     },
-    async get(k) { const db = await this.open(); return new Promise((res) => { const r = db.transaction("levels").objectStore("levels").get(k); r.onsuccess = () => res(r.result); r.onerror = () => res(null); }); },
-    async put(k, v) { const db = await this.open(); return new Promise((res) => { const t = db.transaction("levels", "readwrite"); t.objectStore("levels").put(v, k); t.oncomplete = () => res(true); t.onerror = () => res(false); }); },
+    async get(k, st = "levels") { const db = await this.open(); return new Promise((res) => { const r = db.transaction(st).objectStore(st).get(k); r.onsuccess = () => res(r.result); r.onerror = () => res(null); }); },
+    async put(k, v, st = "levels") { const db = await this.open(); return new Promise((res) => { const t = db.transaction(st, "readwrite"); t.objectStore(st).put(v, k); t.oncomplete = () => res(true); t.onerror = () => res(false); }); },
     async all() { const db = await this.open(); return new Promise((res) => { const r = db.transaction("levels").objectStore("levels").getAll(); r.onsuccess = () => res(r.result || []); r.onerror = () => res([]); }); },
   };
 
@@ -993,6 +995,19 @@
   audio.onStart.push((name) => spMod.onSound(name));
   DB.all().then((rs) => rs.forEach((r) => r.song && spMod.knownSongs.add(r.song))).catch(() => {});
 
+  // While a backup is being restored, nothing may write the game's save store, or the game
+  // (still running with the old progress) could overwrite it before the page reloads.
+  const saveBlock = { on: false };
+  {
+    const origPut = IDBObjectStore.prototype.put;
+    IDBObjectStore.prototype.put = function () {
+      if (saveBlock.on && this.name === "files" && this.transaction && this.transaction.db && this.transaction.db.name === "gdwasm_saves" && !saveBlock.allow) {
+        return this.get("__dashmods_ignored__");   // a harmless request, so the caller's handlers still run
+      }
+      return origPut.apply(this, arguments);
+    };
+  }
+
   // ------------------------------------------------------------------ smooth autosave
   // The page asks the game to save every 10 seconds. Geometry Dash encodes and compresses
   // its whole save file (including every downloaded level) to do that, which freezes a
@@ -1023,6 +1038,7 @@
     if (!M || !window.__gdGameStarted || typeof M._gd_request_save !== "function") return setTimeout(hookSave, 500);
     let orig = null;
     const wrapper = function () {
+      if (saveBlock.on) return;
       if (saveMod.enabled() && !saveMod.allowedNow()) { saveMod.pending = true; return; }
       saveMod.pending = false;
       saveMod.lastSave = realNow();
@@ -1037,6 +1053,281 @@
     }, 500);
     document.addEventListener("visibilitychange", () => { if (saveMod.pending && document.visibilityState === "hidden") M._gd_request_save(); });
   })();
+
+  // ------------------------------------------------------------------ fast loading
+  const fastMod = defineMod({
+    id: "dashmods.fast-loading",
+    name: "Fast Loading",
+    version: "1.0.0",
+    author: "gd-web",
+    icon: "⚡",
+    color: "#f59e0b",
+    tags: ["performance"],
+    defaultEnabled: true,
+    short: "Keeps the game's files in your browser so it starts much faster next time.",
+    desc: "The game downloads about 366 MB of files every time you open it, because the place they're hosted only lets browsers keep them for 5 minutes. With this on, they're stored in your browser after the first full load, so later visits start from your own disk. Turn it off (or use Clear) to free the space.",
+    settings: [
+      { key: "size", type: "action", label: "Space used by cached game files", button: "Check", run: async () => toast("Cached game files: " + (await fastMod.cachedMB()) + " MB") },
+      { key: "clear", type: "action", label: "Delete cached game files", button: "Clear", run: async () => { await fastMod.clear(); toast("Cached game files deleted"); } },
+    ],
+    async cachedMB() {
+      if (!window.caches) return 0;
+      const c = await caches.open("gd-files-v1");
+      let total = 0;
+      for (const req of await c.keys()) { const r = await c.match(req); total += Number(r.headers.get("content-length")) || 0; }
+      return Math.round(total / 1048576);
+    },
+    async clear() { if (window.caches) await caches.delete("gd-files-v1"); },
+    async onEnable() {
+      if (!("serviceWorker" in navigator)) return;
+      // The page has a <base> pointing at GitHub, so give the full address of the worker.
+      try { await navigator.serviceWorker.register(location.origin + "/sw.js", { scope: location.origin + "/" }); }
+      catch (e) { console.warn("[DashMods] service worker not registered:", e.message); }
+    },
+    async onDisable() {
+      if ("serviceWorker" in navigator) for (const r of await navigator.serviceWorker.getRegistrations()) await r.unregister();
+      await this.clear();
+    },
+  });
+
+  // ------------------------------------------------------------------ save backup
+  const SAVE_DB = "gdwasm_saves";
+  function saveStore(mode, fn) {
+    return new Promise((resolve, reject) => {
+      const q = indexedDB.open(SAVE_DB, 1);
+      q.onupgradeneeded = () => q.result.createObjectStore("files");
+      q.onerror = () => reject(q.error);
+      q.onsuccess = () => {
+        const db = q.result, tx = db.transaction("files", mode), st = tx.objectStore("files");
+        let out;
+        Promise.resolve(fn(st)).then((v) => { out = v; });
+        tx.oncomplete = () => { db.close(); resolve(out); };
+        tx.onerror = () => { db.close(); reject(tx.error); };
+      };
+    });
+  }
+  function readSaveFiles(filter) {
+    return saveStore("readonly", (st) => new Promise((res) => {
+      const files = {};
+      st.openCursor().onsuccess = (e) => {
+        const c = e.target.result;
+        if (!c) return res(files);
+        if (filter(String(c.key))) files[c.key] = c.value;
+        c.continue();
+      };
+    }));
+  }
+  const isProgress = (k) => /\.dat$/i.test(k);
+  const toB64 = (u8) => { let s = ""; for (let i = 0; i < u8.length; i += 0x8000) s += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000)); return btoa(s); };
+  const fromB64 = (b) => Uint8Array.from(atob(b), (c) => c.charCodeAt(0));
+  const backupMod = defineMod({
+    id: "dashmods.save-backup",
+    name: "Save Backup",
+    version: "1.0.0",
+    author: "gd-web",
+    icon: "⇩",
+    color: "#22c55e",
+    tags: ["tools"],
+    locked: true,
+    defaultEnabled: true,
+    short: "Download your progress as a file and restore it later or on another computer.",
+    desc: "Your progress lives only in this browser. Download a backup to keep it safe, or to move it to another browser or computer and restore it there. Restoring replaces the progress in this browser and reloads the game; your progress from before the restore is kept so you can undo it.",
+    settings: [
+      { key: "dl", type: "action", label: "Download backup (progress and your levels)", button: "Download", run: () => backupMod.download(false) },
+      { key: "dlSongs", type: "action", label: "Download backup including downloaded songs", help: "Much bigger file, but you won't need to download the songs again.", button: "Download", run: () => backupMod.download(true) },
+      { key: "restore", type: "action", label: "Restore from a backup file", button: "Choose file…", run: () => backupMod.pickFile() },
+      { key: "undo", type: "action", label: "Undo the last restore", button: "Undo", run: () => backupMod.undo() },
+    ],
+    async download(withSongs) {
+      // Make sure the newest progress is in storage first.
+      try { saveMod.pending = false; window.Module && window.Module._gd_request_save && window.Module._gd_request_save(); } catch (e) {}
+      await sleep(1500);
+      const files = await readSaveFiles((k) => isProgress(k) || (withSongs && /\.(mp3|ogg)$/i.test(k)));
+      if (!Object.keys(files).length) return toast("Nothing to back up yet");
+      const data = { format: "gd-web-backup", version: 1, created: new Date().toISOString(), files: {} };
+      for (const k in files) data.files[k] = toB64(new Uint8Array(files[k]));
+      const blob = new Blob([JSON.stringify(data)], { type: "application/json" });
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = "geometry-dash-backup-" + new Date().toISOString().slice(0, 10) + (withSongs ? "-with-songs" : "") + ".json";
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(a.href), 60000);
+      toast("Backup downloaded (" + Math.max(1, Math.round(blob.size / 1024)) + " KB)");
+    },
+    pickFile() {
+      const inp = document.createElement("input");
+      inp.type = "file"; inp.accept = ".json,application/json";
+      inp.onchange = async () => { const f = inp.files && inp.files[0]; if (f) await this.restoreFile(f); };
+      inp.click();
+    },
+    async restoreFile(file) {
+      let data;
+      try { data = JSON.parse(await file.text()); } catch (e) { return toast("That file isn't a backup"); }
+      if (!data || data.format !== "gd-web-backup" || !data.files || !Object.keys(data.files).some(isProgress)) return toast("That file isn't a Geometry Dash backup");
+      const when = data.created ? new Date(data.created).toLocaleString() : "an unknown date";
+      const ok = await ui.confirm("Restore backup?", `This replaces the progress in this browser with the backup from ${when}. The game will reload. (You can undo this afterwards.)`, "Restore");
+      if (!ok) return;
+      const files = {};
+      for (const k in data.files) files[k] = fromB64(data.files[k]);
+      await this.apply(files, true);
+    },
+    async undo() {
+      const prev = await DB.get("before-restore", "backups");
+      if (!prev || !prev.files) return toast("There's no restore to undo");
+      const ok = await ui.confirm("Undo restore?", `Go back to the progress you had before the last restore (${new Date(prev.t).toLocaleString()})? The game will reload.`, "Undo");
+      if (ok) await this.apply(prev.files, false);
+    },
+    async apply(files, keepUndo) {
+      if (keepUndo) {
+        const current = await readSaveFiles(isProgress);
+        await DB.put("before-restore", { t: Date.now(), files: Object.fromEntries(Object.entries(current).map(([k, v]) => [k, new Uint8Array(v)])) }, "backups");
+      }
+      saveBlock.on = true;            // stop the running game from saving over it
+      saveBlock.allow = true;
+      try {
+        await saveStore("readwrite", (st) => {
+          if (Object.keys(files).some(isProgress)) for (const k of ["AppData/CCGameManager.dat", "AppData/CCLocalLevels.dat"]) if (!(k in files)) st.delete(k);
+          for (const k in files) st.put(files[k], k);
+        });
+      } finally { saveBlock.allow = false; }
+      toast("Restored – reloading…");
+      setTimeout(() => location.reload(), 600);
+    },
+  });
+
+  // ------------------------------------------------------------------ practice stats
+  const fmtTime = (ms) => {
+    const s = Math.max(0, ms / 1000), m = Math.floor(s / 60);
+    return m ? `${m}:${String(Math.floor(s % 60)).padStart(2, "0")}` : (s < 10 ? s.toFixed(1) : String(Math.floor(s))) + "s";
+  };
+  const statsMod = defineMod({
+    id: "dashmods.practice-stats",
+    name: "Practice Stats",
+    version: "1.0.0",
+    author: "gd-web",
+    icon: "☠",
+    color: "#a855f7",
+    tags: ["practice", "interface"],
+    short: "Counts attempts and deaths and times your runs while you play a level.",
+    desc: "Shows attempts, deaths, time spent in the level (not counting pauses), how long your current attempt has lasted and your longest attempt. Counting keeps going when you restart the same level (for example with the Startpos Switcher) and starts over when you play a different one. Deaths are counted from the death sound, so they're only counted while sound effects play.",
+    settings: [
+      { key: "pos", type: "select", label: "Position", default: "top-right", options: POSITIONS.map((p) => [p, p.replace("-", " ")]) },
+      { key: "showTime", type: "bool", label: "Show time in level", default: true },
+      { key: "showRun", type: "bool", label: "Show current and longest attempt", default: true },
+      { key: "keyReset", type: "key", label: "Reset stats key", default: "" },
+    ],
+    hotkeys: [{ setting: "keyReset", run: () => { statsMod.reset(statsMod.st.song); toast("Stats reset"); } }],
+    st: null,
+    reset(song) { this.st = { song: song || "", attempts: 1, deaths: 0, timeMs: 0, runStart: realNow(), best: 0, practice: false }; },
+    onSound(name) {
+      if (/^playSound/i.test(name)) this.entering = true;
+      else if (/^explode_11/i.test(name) && this.st && spMod.inLevel) {
+        const run = realNow() - this.st.runStart;
+        this.st.best = Math.max(this.st.best, run);
+        this.st.deaths++; this.st.attempts++;
+        this.st.runStart = realNow();
+      }
+    },
+    tick() {
+      const now = realNow(), dt = now - (this.last || now);
+      this.last = now;
+      if (!spMod.inLevel) return removeHud("stats");
+      const song = spMod.songNow().name;
+      if (this.entering && song) {
+        this.entering = false;
+        // Practice mode plays its own music, so it counts as the same level as before.
+        const practice = /^StayInsideMe/i.test(song);
+        const same = this.st && (practice || this.st.song === song);
+        if (!same) this.reset(song);
+        else { this.st.attempts++; this.st.runStart = now; }
+        this.st.practice = practice;
+      }
+      if (!this.st) this.reset(song);
+      this.st.practice = /^StayInsideMe/i.test(song);
+      const paused = spMod.pauseMenuOpen() || clock.holds.size;
+      if (!paused) this.st.timeMs += dt * clock.speed;
+      else this.st.runStart += dt;   // pauses don't count towards the current attempt
+      const el = hudSlot("stats", this.get("pos"));
+      if (!el) return;
+      const st = this.st, parts = [`⟳ ${st.attempts}`, `☠ ${st.deaths}`];
+      if (this.get("showTime")) parts.push(`⏱ ${fmtTime(st.timeMs)}`);
+      let html = (st.practice ? "<small>PRACTICE</small> " : "") + parts.join("&nbsp;&nbsp;");
+      if (this.get("showRun")) html += `<div class="dm-stats">run ${fmtTime(now - st.runStart)} · best ${fmtTime(st.best)}</div>`;
+      el.innerHTML = html;
+    },
+    onEnable() { clearInterval(this.timer); this.last = realNow(); this.timer = setInterval(() => this.tick(), 200); },
+    onDisable() { clearInterval(this.timer); removeHud("stats"); },
+    onSetting() { this.tick(); },
+  });
+  audio.onStart.push((name) => statsMod.onSound(name));
+
+  // ------------------------------------------------------------------ quality of life
+  const fullMod = defineMod({
+    id: "dashmods.fullscreen",
+    name: "Fullscreen Key",
+    version: "1.0.0",
+    author: "gd-web",
+    icon: "⛶",
+    color: "#0ea5e9",
+    tags: ["interface"],
+    defaultEnabled: true,
+    short: "Press a key to make the game fill your whole screen.",
+    desc: "Toggles fullscreen for the game page. Esc or the same key leaves fullscreen.",
+    settings: [{ key: "key", type: "key", label: "Fullscreen key", default: "F2" }],
+    hotkeys: [{ setting: "key", run: () => fullMod.toggle() }],
+    toggle() {
+      if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+      else document.documentElement.requestFullscreen({ navigationUI: "hide" }).catch(() => toast("Fullscreen isn't allowed here"));
+    },
+  });
+
+  const autoPauseMod = defineMod({
+    id: "dashmods.auto-pause",
+    name: "Auto Pause",
+    version: "1.0.0",
+    author: "gd-web",
+    icon: "⏸",
+    color: "#ef4444",
+    tags: ["gameplay"],
+    defaultEnabled: true,
+    short: "Pauses the level when you switch tabs or click away, so you don't die in the background.",
+    desc: "The game keeps running when its tab is in the background. With this on, it pauses as soon as you switch tabs or windows while playing a level.",
+    settings: [{ key: "onBlur", type: "bool", label: "Also pause when the window loses focus", default: true,
+      help: "Off: only pause when the tab is hidden." }],
+    pause() {
+      if (!this.enabled() || !spMod.inLevel || spMod.busy || ui.isOpen()) return;
+      if (spMod.pauseMenuOpen()) return;   // already paused: Esc would leave the level
+      const M = window.Module;
+      if (!M || !M.gdInputQueue) return;
+      M.gdInputQueue.push([0x100, 27, 0x00010001]);
+      setTimeout(() => M.gdInputQueue.push([0x101, 27, 0xc0010001 | 0]), 80);
+    },
+  });
+  document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") autoPauseMod.pause(); });
+  window.addEventListener("blur", () => { if (autoPauseMod.get("onBlur")) autoPauseMod.pause(); });
+
+  const cursorMod = defineMod({
+    id: "dashmods.hide-cursor",
+    name: "Hide Cursor",
+    version: "1.0.0",
+    author: "gd-web",
+    icon: "➶",
+    color: "#94a3b8",
+    tags: ["interface"],
+    short: "Hides the mouse pointer while you're playing a level.",
+    desc: "The pointer disappears after a moment of not moving the mouse during a level, and comes back when you move it, pause or leave the level.",
+    settings: [],
+    moved: 0,
+    tick() {
+      const c = document.getElementById("canvas");
+      if (!c) return;
+      const hide = this.enabled() && spMod.inLevel && !spMod.pauseMenuOpen() && !ui.isOpen() && realNow() - this.moved > 1200;
+      c.style.cursor = hide ? "none" : "";
+    },
+    onEnable() { clearInterval(this.timer); this.timer = setInterval(() => this.tick(), 250); },
+    onDisable() { clearInterval(this.timer); this.tick(); },
+  });
+  window.addEventListener("mousemove", () => { cursorMod.moved = realNow(); }, true);
 
   // Rewrite level downloads. Installed before the page's own proxy wrapper, which then
   // calls this one, so it sees the final proxied request.
@@ -1317,6 +1608,23 @@
       pop.refresh = () => { const n = this.stack.indexOf(pop); if (n >= 0) { pop.remove(); this.stack.splice(n, 1); this.openMod(m); } };
       this.push(pop);
     },
+    confirm(title, text, yes) {
+      return new Promise((resolve) => {
+        const pop = h(`<div class="dm-panel dm-pop">
+          <div class="dm-head"><div class="dm-title dm-out" style="font-size:22px">${esc(title)}</div></div>
+          <div class="dm-body">${esc(text)}</div>
+          <div class="dm-foot"><button class="dm-btn2 grey dm-out">Cancel</button><div style="flex:1"></div>
+          <button class="dm-btn2 dm-out">${esc(yes)}</button></div></div>`);
+        const [no, ok] = pop.querySelectorAll(".dm-foot .dm-btn2");
+        let done = false;
+        const finish = (v) => { if (done) return; done = true; if (this.stack.includes(pop)) this.closeTop(); resolve(v); };
+        no.onclick = () => finish(false);
+        ok.onclick = () => finish(true);
+        const obs = new MutationObserver(() => { if (!pop.isConnected) { obs.disconnect(); finish(false); } });
+        obs.observe(this.shade, { childList: true });
+        this.push(pop);
+      });
+    },
     openSettings(m) {
       const pop = h(`<div class="dm-panel dm-pop">
         <div class="dm-head"><div class="dm-title dm-out" style="font-size:22px">${esc(m.name)} settings</div>
@@ -1356,6 +1664,15 @@
             };
             row.appendChild(b);
             row.querySelector("label").insertAdjacentHTML("beforeend", `<span class="help">Backspace clears it, Esc cancels.</span>`);
+          } else if (s.type === "action") {
+            const b = h(`<button class="dm-btn2 dm-out" style="flex:none">${esc(s.button || "Run")}</button>`);
+            b.onclick = async () => {
+              if (b.disabled) return;
+              b.disabled = true;
+              try { await s.run(m); } catch (e) { console.error("[DashMods]", e); toast("Something went wrong: " + e.message); }
+              finally { b.disabled = false; }
+            };
+            row.appendChild(b);
           }
           body.appendChild(row);
         }
@@ -1363,6 +1680,7 @@
       draw();
       pop.querySelector(".dm-x").onclick = () => this.closeTop();
       const [resetBtn, doneBtn] = pop.querySelectorAll(".dm-foot .dm-btn2");
+      if (!m.settings.some((x) => x.type !== "action")) resetBtn.style.visibility = "hidden";
       resetBtn.onclick = () => {
         store.settings[m.id] = {};
         persist();

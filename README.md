@@ -33,6 +33,12 @@ Everything is saved in your browser.
 | FPS Counter | Shows the game's frame rate | – |
 | Input Display | Shows jump/left/right inputs, clicks per second and total clicks | – |
 | Startpos Switcher | In online levels that contain start positions, jumps between them and restarts there | `Q` previous, `E` next |
+| Practice Stats | Attempts, deaths, time in level, current and longest attempt | optional reset key |
+| Fast Loading (on by default) | Caches the ~366 MB of game files in the browser (service worker `sw.js`) so later visits start fast | – |
+| Save Backup | Download progress as a file, restore it (with undo) | – |
+| Fullscreen Key (on by default) | Toggle fullscreen | `F2` |
+| Auto Pause (on by default) | Pauses the level when you switch tabs or click away | – |
+| Hide Cursor | Hides the mouse pointer while playing | – |
 | Smooth Autosave (on by default) | Holds the 10-second autosave while you're playing a level; saves on pause, leaving the level, switching tabs, or every 3 minutes | – |
 
 How it works: the engine reads time from `performance.now()`/`Date.now()`, so the speedhack
