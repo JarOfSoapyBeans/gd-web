@@ -20,12 +20,16 @@
     if (raw) store = Object.assign(store, JSON.parse(raw));
   } catch (e) {}
   let saveTimer = 0;
+  function persistNow() {
+    clearTimeout(saveTimer); saveTimer = 0;
+    try { localStorage.setItem(STORE_KEY, JSON.stringify(store)); } catch (e) {}
+  }
   function persist() {
     clearTimeout(saveTimer);
-    saveTimer = setTimeout(() => {
-      try { localStorage.setItem(STORE_KEY, JSON.stringify(store)); } catch (e) {}
-    }, 150);
+    saveTimer = setTimeout(persistNow, 150);
   }
+  // Never lose a setting changed right before the page is reloaded or closed.
+  window.addEventListener("pagehide", () => { if (saveTimer) persistNow(); });
 
   // ------------------------------------------------------------------ blocked-song cleanup
   // Newgrounds answers blocked downloads with a short "hotlinking disabled" clip (always the
@@ -192,11 +196,17 @@
   const YIELD_HOOK = "var __dmP=window.__dmYield&&window.__dmYield(target_ms);if(__dmP)await __dmP;";
   const gate = { hooked: false, waiters: [], yields: 0, lastTarget: 0 };
   const insertFns = { appendChild: Node.prototype.appendChild, insertBefore: Node.prototype.insertBefore };
+  // Second hook: once the engine's files are mounted but before the game starts, give mods
+  // (the texture pack) a chance to change files. The engine waits for window.__dmBeforeStart.
+  const START_MARK = 'initRuntime();Module["onRuntimeInitialized"]?.();';
+  const START_HOOK = 'initRuntime();try{if(window.__dmBeforeStart)await window.__dmBeforeStart(FS)}catch(e){console.error("[DashMods] before start",e)}Module["onRuntimeInitialized"]?.();';
   function patchScript(node) {
     if (gate.hooked || !node || node.nodeName !== "SCRIPT" || node.src) return;
-    const text = node.text;
+    let text = node.text;
     if (text && text.indexOf(YIELD_MARK) >= 0) {
-      node.text = text.replace(YIELD_MARK, YIELD_MARK + YIELD_HOOK);
+      text = text.replace(YIELD_MARK, YIELD_MARK + YIELD_HOOK);
+      if (text.indexOf(START_MARK) >= 0) { text = text.replace(START_MARK, START_HOOK); gate.startHooked = true; }
+      node.text = text;
       gate.hooked = true;
       Node.prototype.appendChild = insertFns.appendChild; // done; restore
       Node.prototype.insertBefore = insertFns.insertBefore;
@@ -316,7 +326,7 @@
     mod.setEnabled = (on) => {
       if (mod.locked) return;
       store.enabled[mod.id] = !!on;
-      persist();
+      persistNow();
       try { on ? mod.onEnable && mod.onEnable() : mod.onDisable && mod.onDisable(); } catch (e) { console.error(e); }
     };
     for (const hk of mod.hotkeys) {
@@ -598,9 +608,9 @@
   const DB = {
     open() {
       if (!this.p) this.p = new Promise((res, rej) => {
-        const q = indexedDB.open("dashmods", 2);
+        const q = indexedDB.open("dashmods", 3);
         q.onupgradeneeded = () => {
-          for (const name of ["levels", "backups"]) if (!q.result.objectStoreNames.contains(name)) q.result.createObjectStore(name);
+          for (const name of ["levels", "backups", "textures"]) if (!q.result.objectStoreNames.contains(name)) q.result.createObjectStore(name);
         };
         q.onsuccess = () => res(q.result);
         q.onerror = () => rej(q.error);
@@ -1329,6 +1339,293 @@
   });
   window.addEventListener("mousemove", () => { cursorMod.moved = realNow(); }, true);
 
+  // ------------------------------------------------------------------ texture packs
+  // The engine looks for every texture in /AppData/ before /Resources/ (like Windows GD's
+  // texture-pack folder). So the mod writes replacement files into /AppData/ just before the
+  // game starts (hook in gd_web.js) and never touches the originals; off = nothing written.
+  const PNG = {
+    crcTable: (() => { const t = new Uint32Array(256); for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; } return t; })(),
+    crc(bytes, start, end) { let c = 0xffffffff; for (let i = start; i < end; i++) c = PNG.crcTable[(c ^ bytes[i]) & 0xff] ^ (c >>> 8); return (c ^ 0xffffffff) >>> 0; },
+    chunks(b) {
+      const dv = new DataView(b.buffer, b.byteOffset, b.byteLength), out = [];
+      for (let p = 8; p + 8 <= b.length; ) {
+        const len = dv.getUint32(p), type = String.fromCharCode(b[p + 4], b[p + 5], b[p + 6], b[p + 7]);
+        out.push({ type, start: p, data: b.subarray(p + 8, p + 8 + len) });
+        p += 12 + len;
+        if (type === "IEND") break;
+      }
+      return out;
+    },
+    async pipe(bytes, stream) { return new Uint8Array(await new Response(new Blob([bytes]).stream().pipeThrough(stream)).arrayBuffer()); },
+    chunk(type, data) {
+      const out = new Uint8Array(12 + data.length), dv = new DataView(out.buffer);
+      dv.setUint32(0, data.length);
+      for (let i = 0; i < 4; i++) out[4 + i] = type.charCodeAt(i);
+      out.set(data, 8);
+      dv.setUint32(8 + data.length, PNG.crc(out, 4, 8 + data.length));
+      return out;
+    },
+    // A broken image would crash the game's loader, so only ever hand it a real PNG.
+    valid(b) {
+      if (!b || b.length < 45) return false;
+      const sig = [137, 80, 78, 71, 13, 10, 26, 10];
+      for (let i = 0; i < 8; i++) if (b[i] !== sig[i]) return false;
+      const ch = PNG.chunks(b);
+      return ch.length >= 3 && ch[0].type === "IHDR" && ch.some((c) => c.type === "IDAT") && ch[ch.length - 1].type === "IEND";
+    },
+    concat(parts) { let n = 0; for (const p of parts) n += p.length; const o = new Uint8Array(n); let k = 0; for (const p of parts) { o.set(p, k); k += p.length; } return o; },
+    // Recolor a PNG with a color function f(r,g,b) -> [r,g,b] (in place on Uint8 arrays).
+    async recolor(bytes, apply) {
+      const ch = PNG.chunks(bytes), ihdr = ch.find((c) => c.type === "IHDR");
+      if (!ihdr) return null;
+      const dv = new DataView(ihdr.data.buffer, ihdr.data.byteOffset);
+      const w = dv.getUint32(0), h = dv.getUint32(4), depth = ihdr.data[8], type = ihdr.data[9], interlace = ihdr.data[12];
+      if (depth !== 8 || interlace !== 0) return null;
+      if (type === 3) {   // palette: just recolor the palette
+        const plte = ch.find((c) => c.type === "PLTE");
+        if (!plte) return null;
+        const pal = new Uint8Array(plte.data);
+        apply(pal, 0, pal.length, 3);
+        return PNG.concat([bytes.subarray(0, 8)].concat(ch.map((c) => (c === plte ? PNG.chunk("PLTE", pal) : bytes.subarray(c.start, c.start + 12 + c.data.length)))));
+      }
+      const bpp = { 6: 4, 2: 3, 0: 1, 4: 2 }[type];
+      if (!bpp || type === 0 || type === 4) return null;   // grayscale: nothing to recolor
+      const raw = await PNG.pipe(PNG.concat(ch.filter((c) => c.type === "IDAT").map((c) => c.data)), new DecompressionStream("deflate"));
+      const stride = w * bpp, px = new Uint8Array(h * stride);
+      for (let y = 0; y < h; y++) {   // undo PNG row filters
+        const f = raw[y * (stride + 1)], src = y * (stride + 1) + 1, dst = y * stride, up = dst - stride;
+        for (let x = 0; x < stride; x++) {
+          const a = x >= bpp ? px[dst + x - bpp] : 0, b = y ? px[up + x] : 0, c = x >= bpp && y ? px[up + x - bpp] : 0;
+          let v = raw[src + x];
+          if (f === 1) v += a; else if (f === 2) v += b; else if (f === 3) v += (a + b) >> 1;
+          else if (f === 4) { const p = a + b - c, pa = Math.abs(p - a), pb = Math.abs(p - b), pc = Math.abs(p - c); v += pa <= pb && pa <= pc ? a : pb <= pc ? b : c; }
+          px[dst + x] = v;
+        }
+      }
+      apply(px, 0, px.length, bpp);
+      const filtered = new Uint8Array(h * (stride + 1));   // re-filter with "sub" (good compression, cheap)
+      for (let y = 0; y < h; y++) {
+        const o = y * (stride + 1), s = y * stride;
+        filtered[o] = 1;
+        for (let x = 0; x < stride; x++) filtered[o + 1 + x] = px[s + x] - (x >= bpp ? px[s + x - bpp] : 0);
+      }
+      const idat = await PNG.pipe(filtered, new CompressionStream("deflate"));
+      return PNG.concat([bytes.subarray(0, 8), PNG.chunk("IHDR", ihdr.data), PNG.chunk("IDAT", idat), PNG.chunk("IEND", new Uint8Array(0))]);
+    },
+  };
+
+  // 3x4 color matrix from the recolor settings (same math as CSS filters).
+  function colorMatrix(o) {
+    const mul = (A, B) => { const R = []; for (let i = 0; i < 3; i++) { R[i] = []; for (let j = 0; j < 4; j++) R[i][j] = A[i][0] * B[0][j] + A[i][1] * B[1][j] + A[i][2] * B[2][j] + (j === 3 ? A[i][3] : 0); } return R; };
+    let M = [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0]];
+    const t = (o.hue * Math.PI) / 180, c = Math.cos(t), s = Math.sin(t);
+    M = mul([[0.213 + c * 0.787 - s * 0.213, 0.715 - c * 0.715 - s * 0.715, 0.072 - c * 0.072 + s * 0.928, 0],
+             [0.213 - c * 0.213 + s * 0.143, 0.715 + c * 0.285 + s * 0.14, 0.072 - c * 0.072 - s * 0.283, 0],
+             [0.213 - c * 0.213 - s * 0.787, 0.715 - c * 0.715 + s * 0.715, 0.072 + c * 0.928 + s * 0.072, 0]], M);
+    const sat = o.gray ? 0 : o.sat;
+    M = mul([[0.213 + 0.787 * sat, 0.715 - 0.715 * sat, 0.072 - 0.072 * sat, 0],
+             [0.213 - 0.213 * sat, 0.715 + 0.285 * sat, 0.072 - 0.072 * sat, 0],
+             [0.213 - 0.213 * sat, 0.715 - 0.715 * sat, 0.072 + 0.928 * sat, 0]], M);
+    const k = o.contrast, off = (0.5 - 0.5 * k) * 255;
+    M = mul([[k * o.bright, 0, 0, off], [0, k * o.bright, 0, off], [0, 0, k * o.bright, off]], M);
+    if (o.invert) M = mul([[-1, 0, 0, 255], [0, -1, 0, 255], [0, 0, -1, 255]], M);
+    return M;
+  }
+  function makeApply(M) {
+    const m = M.flat();
+    return (bytes, start, end, step) => {
+      // Write through a clamped view: a plain Uint8Array would wrap -92 around to 164.
+      const a = new Uint8ClampedArray(bytes.buffer, bytes.byteOffset, bytes.length);
+      for (let i = start; i + 2 < end; i += step) {
+        const r = a[i], g = a[i + 1], b = a[i + 2];
+        a[i] = m[0] * r + m[1] * g + m[2] * b + m[3];
+        a[i + 1] = m[4] * r + m[5] * g + m[6] * b + m[7];
+        a[i + 2] = m[8] * r + m[9] * g + m[10] * b + m[11];
+      }
+    };
+  }
+
+  // Minimal .zip reader (stored and deflate entries).
+  async function readZip(buf) {
+    const b = new Uint8Array(buf), dv = new DataView(buf);
+    let eocd = -1;
+    for (let i = b.length - 22; i >= Math.max(0, b.length - 65557); i--) if (dv.getUint32(i, true) === 0x06054b50) { eocd = i; break; }
+    if (eocd < 0) throw new Error("not a zip file");
+    const n = dv.getUint16(eocd + 10, true);
+    let p = dv.getUint32(eocd + 16, true);
+    const files = {}, dec = new TextDecoder();
+    for (let k = 0; k < n; k++) {
+      if (dv.getUint32(p, true) !== 0x02014b50) break;
+      const method = dv.getUint16(p + 10, true), csize = dv.getUint32(p + 20, true);
+      const nlen = dv.getUint16(p + 28, true), xlen = dv.getUint16(p + 30, true), clen = dv.getUint16(p + 32, true), lho = dv.getUint32(p + 42, true);
+      const name = dec.decode(b.subarray(p + 46, p + 46 + nlen));
+      p += 46 + nlen + xlen + clen;
+      if (name.endsWith("/")) continue;
+      const ds = lho + 30 + dv.getUint16(lho + 26, true) + dv.getUint16(lho + 28, true);
+      const data = b.subarray(ds, ds + csize);
+      if (method === 0) files[name] = data.slice();
+      else if (method === 8) files[name] = await PNG.pipe(data, new DecompressionStream("deflate-raw"));
+    }
+    return files;
+  }
+
+  const TEX_GROUPS = {
+    objects: { label: "Blocks and objects", re: /^(GJ_GameSheet|GJ_GameSheet02|GJ_GameSheetGlow|GJ_GameSheetEditor)$/ },
+    menus: { label: "Menus and buttons", re: /^(GJ_GameSheet03|GJ_GameSheet04|GJ_LaunchSheet|GJ_ShopSheet|GauntletSheet|WorldSheet|GJ_gradientBG|slidergroove|sliderBar|edit_barBG_001|GJ_square0\d|GJ_button_0\d)$/ },
+    backgrounds: { label: "Backgrounds and grounds", re: /^(game_bg_\d+_001|game_mg_\d+_001|groundSquare_\d+_00\d|groundSquareShadow_001|floorLine_\d+_001)$/ },
+    effects: { label: "Effects (fire, explosions, particles)", re: /^(FireSheet_01|PlayerExplosion_\d+|GJ_ParticleSheet|PixelSheet_01)$/ },
+  };
+  const texMod = defineMod({
+    id: "dashmods.texture-pack",
+    name: "Texture Pack",
+    version: "1.0.0",
+    author: "gd-web",
+    icon: "🎨",
+    color: "#ec4899",
+    tags: ["visual"],
+    short: "Recolor the game's textures, or load your own texture pack.",
+    desc: "Two modes. Recolor changes the hue, saturation, brightness and contrast of the textures you pick. Custom pack uses a texture pack you upload (a .zip, or the image/.plist files), laid out like a normal Geometry Dash texture pack (for example GJ_GameSheet03-uhd.png with its .plist). Changes apply when the game reloads; the first load after a change takes longer while textures are prepared, after that they're cached. Turning the mod off brings back the original textures. Note: many level blocks, backgrounds and icons are white textures that each level colors itself, so recoloring mostly shows on menus, buttons, portals and decorations.",
+    settings: [
+      { key: "mode", type: "select", label: "Mode", default: "recolor", options: [["recolor", "Recolor the game's textures"], ["pack", "Use my uploaded pack"]] },
+      { key: "hue", type: "range", label: "Hue shift (recolor)", default: 120, min: -180, max: 180, step: 5, unit: "°" },
+      { key: "sat", type: "range", label: "Saturation (recolor)", default: 1, min: 0, max: 2, step: 0.05, unit: "×" },
+      { key: "bright", type: "range", label: "Brightness (recolor)", default: 1, min: 0.3, max: 1.7, step: 0.05, unit: "×" },
+      { key: "contrast", type: "range", label: "Contrast (recolor)", default: 1, min: 0.5, max: 1.5, step: 0.05, unit: "×" },
+      { key: "invert", type: "bool", label: "Invert colors (recolor)", default: false },
+      { key: "gray", type: "bool", label: "Black and white (recolor)", default: false },
+      { key: "g_objects", type: "bool", label: "Recolor: " + TEX_GROUPS.objects.label, default: true },
+      { key: "g_menus", type: "bool", label: "Recolor: " + TEX_GROUPS.menus.label, default: true },
+      { key: "g_backgrounds", type: "bool", label: "Recolor: " + TEX_GROUPS.backgrounds.label, default: false },
+      { key: "g_effects", type: "bool", label: "Recolor: " + TEX_GROUPS.effects.label, default: false, help: "Big files: the first load takes longer." },
+      { key: "upload", type: "action", label: "Upload a texture pack (.zip or files)", help: "Replaces any pack you uploaded before.", button: "Choose…", run: () => texMod.pickPack() },
+      { key: "packInfo", type: "action", label: "Uploaded pack", button: "Show", run: async () => { const m = await DB.get("pack-meta", "textures"); toast(m ? `${m.name}: ${m.count} files` : "No pack uploaded"); } },
+      { key: "apply", type: "action", label: "Apply changes now (reloads the game)", button: "Apply", run: () => texMod.applyNow() },
+    ],
+    dirty: false,
+    onEnable() { this.dirty = true; toast("Texture Pack on – press Apply in its settings, or reload"); },
+    onDisable() { this.dirty = true; toast("Texture Pack off – reload to see the original textures"); },
+    onSetting() { this.dirty = true; },
+    async applyNow() {
+      const ok = await ui.confirm("Apply textures?", "The game reloads to load the new textures. Your progress is saved first.", "Reload");
+      if (!ok) return;
+      try { saveMod.pending = false; window.Module && window.Module._gd_request_save && window.Module._gd_request_save(); } catch (e) {}
+      toast("Saving and reloading…");
+      setTimeout(() => location.reload(), 1500);
+    },
+    pickPack() {
+      const inp = document.createElement("input");
+      inp.type = "file"; inp.multiple = true; inp.accept = ".zip,.png,.plist,.fnt";
+      inp.onchange = async () => {
+        const list = [...(inp.files || [])];
+        if (!list.length) return;
+        toast("Reading pack…");
+        const files = {};
+        for (const f of list) {
+          if (/\.zip$/i.test(f.name)) Object.assign(files, await readZip(await f.arrayBuffer()));
+          else files[f.webkitRelativePath || f.name] = new Uint8Array(await f.arrayBuffer());
+        }
+        const usable = Object.keys(files).filter((k) => /\.(png|plist|fnt)$/i.test(k));
+        if (!usable.length) return toast("No textures (.png/.plist/.fnt) found in that pack");
+        const db = await DB.open();
+        await new Promise((res) => {
+          const tx = db.transaction("textures", "readwrite"), st = tx.objectStore("textures");
+          st.clear();
+          for (const k of usable) st.put(files[k], "pack:" + k);
+          st.put({ name: list.length === 1 ? list[0].name : list.length + " files", count: usable.length, t: Date.now() }, "pack-meta");
+          tx.oncomplete = res; tx.onerror = res;
+        });
+        this.set("mode", "pack");
+        toast(`Pack saved (${usable.length} files) – press Apply`);
+      };
+      inp.click();
+    },
+    // ---- runs inside the engine's start-up, before the game reads any texture
+    progress(text) {
+      let ov = document.getElementById("dm-switch");
+      if (!ov && ui.root) { ov = document.createElement("div"); ov.id = "dm-switch"; ov.className = "dm-out"; ui.root.appendChild(ov); }
+      if (!ov) return;
+      ov.textContent = text || "";
+      ov.classList.toggle("show", !!text);
+    },
+    async beforeStart(FS) {
+      // Remember which resolution the game asks for, so the next recolor targets it.
+      const origOpen = FS.open;
+      FS.open = function (path) {
+        const m = /GJ_GameSheet03(-uhd|-hd)?\.png$/.exec(String(path));
+        if (m) { try { localStorage.setItem("dashmods.texSuffix", m[1] || ""); } catch (e) {} FS.open = origOpen; }
+        return origOpen.apply(this, arguments);
+      };
+      if (!this.enabled()) return;
+      const write = (rel, data) => {
+        const path = "/AppData/" + rel.replace(/^\/+/, "");
+        const dir = path.slice(0, path.lastIndexOf("/"));
+        try { FS.mkdirTree(dir); } catch (e) {}
+        FS.writeFile(path, data);
+      };
+      if (this.get("mode") === "pack") return this.writePack(FS, write);
+      return this.writeRecolor(FS, write);
+    },
+    async writePack(FS, write) {
+      const db = await DB.open();
+      const entries = await new Promise((res) => {
+        const out = [], tx = db.transaction("textures"), st = tx.objectStore("textures");
+        st.openCursor().onsuccess = (e) => { const c = e.target.result; if (!c) return; if (String(c.key).startsWith("pack:")) out.push([String(c.key).slice(5), c.value]); c.continue(); };
+        tx.oncomplete = () => res(out);
+      });
+      // Match each file to the game's own path: drop leading folders until it names a real
+      // resource (packs often put files under "resources/" or a pack-name folder).
+      const exists = (rel) => { try { return FS.analyzePath("/Resources/" + rel).exists; } catch (e) { return false; } };
+      let n = 0;
+      for (const [name, data] of entries) {
+        const parts = name.replace(/\\/g, "/").split("/").filter(Boolean);
+        let rel = null;
+        for (let i = 0; i < parts.length && !rel; i++) { const r = parts.slice(i).join("/"); if (exists(r)) rel = r; }
+        if (/\.png$/i.test(name) && !PNG.valid(data)) { console.warn("[DashMods] pack: skipped broken image", name); continue; }
+        write(rel || parts[parts.length - 1], data);
+        n++;
+      }
+      console.log("[DashMods] texture pack: wrote", n, "files");
+    },
+    async writeRecolor(FS, write) {
+      const o = { hue: +this.get("hue"), sat: +this.get("sat"), bright: +this.get("bright"), contrast: +this.get("contrast"), invert: !!this.get("invert"), gray: !!this.get("gray") };
+      const groups = Object.keys(TEX_GROUPS).filter((g) => this.get("g_" + g));
+      let suffix = "-uhd";
+      try { const s = localStorage.getItem("dashmods.texSuffix"); if (s !== null) suffix = s; } catch (e) {}
+      const key = JSON.stringify(["v2", o, groups, suffix]);
+      const files = [];
+      const all = FS.readdir("/Resources");
+      for (const name of all) {
+        if (!name.endsWith(suffix + ".png")) continue;
+        const base = name.slice(0, name.length - suffix.length - 4);
+        if (suffix === "" && /-(uhd|hd)$/.test(base)) continue;
+        if (groups.some((g) => TEX_GROUPS[g].re.test(base))) files.push(name);
+      }
+      const db = await DB.open();
+      const cached = await new Promise((res) => { const r = db.transaction("textures").objectStore("textures").get("recolor-key"); r.onsuccess = () => res(r.result); r.onerror = () => res(null); });
+      const fromCache = cached === key;
+      if (!fromCache) await new Promise((res) => { const tx = db.transaction("textures", "readwrite"), st = tx.objectStore("textures"); const rq = st.openCursor(); rq.onsuccess = (e) => { const c = e.target.result; if (!c) return; if (String(c.key).startsWith("rc:")) c.delete(); c.continue(); }; tx.oncomplete = res; });
+      const apply = makeApply(colorMatrix(o));
+      let done = 0;
+      for (const name of files) {
+        let out = null;
+        if (fromCache) out = await DB.get("rc:" + name, "textures");
+        if (!out) {
+          this.progress(`🎨 Preparing textures… ${done + 1}/${files.length}`);
+          await sleep(0);
+          try { out = await PNG.recolor(FS.readFile("/Resources/" + name), apply); } catch (e) { console.warn("[DashMods] recolor failed for", name, e); }
+          if (out && !PNG.valid(out)) { console.warn("[DashMods] skipped invalid recolor of", name); out = null; }
+          if (out) await DB.put("rc:" + name, out, "textures");
+        }
+        if (out && PNG.valid(out)) write(name, out);
+        done++;
+      }
+      if (!fromCache) await DB.put("recolor-key", key, "textures");
+      this.progress("");
+      console.log("[DashMods] recolor:", done, "textures", fromCache ? "(cached)" : "(prepared)");
+    },
+  });
+  window.__dmBeforeStart = (FS) => texMod.beforeStart(FS);
+
   // Rewrite level downloads. Installed before the page's own proxy wrapper, which then
   // calls this one, so it sees the final proxied request.
   const nativeFetch = window.fetch;
@@ -1643,8 +1940,9 @@
             row.appendChild(sw);
           } else if (s.type === "range") {
             const r = h(`<input type="range" min="${s.min}" max="${s.max}" step="${s.step}" value="${v}">`);
-            const val = h(`<span class="val">${Number(v).toFixed(2)}${s.unit || ""}</span>`);
-            r.oninput = () => { val.textContent = Number(r.value).toFixed(2) + (s.unit || ""); m.set(s.key, Number(r.value)); };
+            const dec = s.step >= 1 ? 0 : 2;
+            const val = h(`<span class="val">${Number(v).toFixed(dec)}${s.unit || ""}</span>`);
+            r.oninput = () => { val.textContent = Number(r.value).toFixed(dec) + (s.unit || ""); m.set(s.key, Number(r.value)); };
             row.appendChild(r); row.appendChild(val);
           } else if (s.type === "select") {
             const sel = h(`<select>${s.options.map(([k, l]) => `<option value="${esc(k)}"${k === v ? " selected" : ""}>${esc(l)}</option>`).join("")}</select>`);

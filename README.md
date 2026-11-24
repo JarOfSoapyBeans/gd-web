@@ -39,6 +39,7 @@ Everything is saved in your browser.
 | Fullscreen Key (on by default) | Toggle fullscreen | `F2` |
 | Auto Pause (on by default) | Pauses the level when you switch tabs or click away | – |
 | Hide Cursor | Hides the mouse pointer while playing | – |
+| Texture Pack | Recolor the game's textures (hue/saturation/brightness/contrast, invert, black-and-white, per group) or load an uploaded pack (.zip or files) | – |
 | Smooth Autosave (on by default) | Holds the 10-second autosave while you're playing a level; saves on pause, leaving the level, switching tabs, or every 3 minutes | – |
 
 How it works: the engine reads time from `performance.now()`/`Date.now()`, so the speedhack
@@ -54,3 +55,10 @@ input messages the page sends). Q/E only act while you're in that level, so the 
 rotation is unaffected. Turn the mod on before opening a level's page. During a switch the game
 clock runs ~6x (menu fades run on game time) under a cover screen, and the level data's memory
 location is found in the background while you play so switches don't have to search again.
+
+Texture Pack: the engine looks for every texture in `/AppData/` before `/Resources/`, so the mod
+writes replacement files into `/AppData/` in the engine's virtual file system just before the game
+starts (a hook added to `gd_web.js` as it loads). Originals are never modified; with the mod off
+nothing is written. Recolored textures are cached in IndexedDB (`dashmods` → `textures`). Uploaded
+packs use normal Geometry Dash names (e.g. `GJ_GameSheet03-uhd.png` + `.plist`); leading folders such
+as `MyPack/resources/` are stripped automatically.
